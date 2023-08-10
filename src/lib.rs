@@ -16,7 +16,6 @@ async fn main(req: Request, _env: Env, _: Context) -> Result<Response> {
     server.accept()?;
 
     wasm_bindgen_futures::spawn_local(async move {
-        console_debug!("websocket connection established");
         let event_stream = server.events().expect("could not open stream");
 
         let socket = WebSocketConnection::new(&server, event_stream, early_data);
@@ -27,16 +26,15 @@ async fn main(req: Request, _env: Env, _: Context) -> Result<Response> {
 }
 
 mod proxy {
-    use std::io::Result;
-    use std::io::{Error, ErrorKind};
+    use std::io::{Error, ErrorKind, Result};
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use crate::websocket::WebSocketConnection;
     use crate::CLIENT_ID;
     use base64::decode;
     use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
-    use worker::Socket;
     use worker::console_debug;
+    use worker::Socket;
 
     pub fn parse_early_data(data: Option<String>) -> Result<Option<Vec<u8>>> {
         if let Some(data) = data {
@@ -51,11 +49,8 @@ mod proxy {
     }
 
     pub async fn run_tunnel(mut server_socket: WebSocketConnection<'_>) -> Result<()> {
-        console_debug!("run_tunnel");
         let mut prefix = [0u8; 18];
         server_socket.read_exact(&mut prefix).await?;
-
-        console_debug!("prefix: {:?}", prefix);
 
         if prefix[0] != 0 {
             return Err(std::io::Error::new(
@@ -155,7 +150,7 @@ mod proxy {
                     ((address_bytes[12] as u16) << 8) | (address_bytes[13] as u16),
                     ((address_bytes[14] as u16) << 8) | (address_bytes[15] as u16),
                 );
-                v6addr.to_string()
+                format!("[{}]", v6addr.to_string())
             }
             invalid_type => {
                 return Err(std::io::Error::new(
@@ -165,11 +160,16 @@ mod proxy {
             }
         };
 
-        console_debug!("{}:{}", remote_addr, port);
-
-        let mut remote_socket = match Socket::builder().connect(remote_addr, port) {
+        let mut remote_socket = match Socket::builder().connect(remote_addr.clone(), port) {
             Ok(socket) => socket,
             Err(e) => {
+                console_debug!(
+                    "connect to remote {}:{} error: {}",
+                    remote_addr,
+                    port,
+                    e.to_string()
+                );
+
                 server_socket.close();
 
                 return Err(std::io::Error::new(
@@ -211,6 +211,7 @@ mod proxy {
         bytes.into_boxed_slice()
     }
 
+    #[inline]
     fn allocate_vec<T>(len: usize) -> Vec<T> {
         let mut ret = Vec::with_capacity(len);
         unsafe {
@@ -222,26 +223,23 @@ mod proxy {
 
 mod websocket {
     use futures_util::Stream;
-    use std::io::Error;
-    use std::io::Result;
     use std::{
-        io::ErrorKind,
+        io::{Error, ErrorKind, Result},
         pin::Pin,
         task::{Context, Poll},
     };
 
+    use bytes::{BufMut, BytesMut};
     use pin_project::pin_project;
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
     use worker::{EventStream, WebSocket, WebsocketEvent};
-    use worker::console_debug;
 
     #[pin_project]
     pub struct WebSocketConnection<'a> {
         ws: &'a WebSocket,
         #[pin]
         stream: EventStream<'a>,
-
-        early_data: Option<Vec<u8>>,
+        buffer: BytesMut,
     }
 
     impl<'a> WebSocketConnection<'a> {
@@ -250,10 +248,15 @@ mod websocket {
             stream: EventStream<'a>,
             early_data: Option<Vec<u8>>,
         ) -> Self {
+            let mut buff = BytesMut::with_capacity(4096);
+            if let Some(data) = early_data {
+                buff.put_slice(&data)
+            }
+
             Self {
                 ws,
                 stream,
-                early_data: early_data,
+                buffer: buff,
             }
         }
 
@@ -270,13 +273,10 @@ mod websocket {
             cx: &mut Context<'_>,
             buf: &mut ReadBuf<'_>,
         ) -> Poll<Result<()>> {
-            console_debug!("poll_read");
             let this = self.project();
 
-            if let Some(early_data) = this.early_data {
-                buf.put_slice(early_data);
-
-                *this.early_data = None;
+            if buf.remaining() <= this.buffer.len() {
+                buf.put_slice(&this.buffer.split_to(buf.remaining()));
                 return Poll::Ready(Ok(()));
             }
 
@@ -284,11 +284,17 @@ mod websocket {
             match item {
                 Some(Ok(WebsocketEvent::Message(msg))) => {
                     if let Some(data) = msg.bytes() {
-                        console_debug!("poll_read: {:?}", data);
-                        buf.put_slice(&data);
-                        console_debug!("poll_read put ok");
+                        this.buffer.put_slice(&data);
+
+                        if buf.remaining() <= this.buffer.len() {
+                            buf.put_slice(&this.buffer.split_to(buf.remaining()));
+                        } else if buf.remaining() > this.buffer.len() {
+                            buf.put_slice(&this.buffer.split());
+                        }
+
+                        return Poll::Ready(Ok(()));
                     };
-                    return Poll::Ready(Ok(()));
+                    return Poll::Pending;
                 }
                 Some(Ok(WebsocketEvent::Close(_))) => {
                     Poll::Ready(Err(Error::new(ErrorKind::Other, "Connection closed")))
