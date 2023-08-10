@@ -1,6 +1,6 @@
-# Template: worker-rust
+# workers-tunnel
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cloudflare/templates/tree/main/worker-rust)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/zhu327/workers-tunnel/tree/main)
 
 A template for kick starting a Cloudflare worker project using [`workers-rs`](https://github.com/cloudflare/workers-rs).
 
@@ -11,11 +11,11 @@ This template is designed for compiling Rust to WebAssembly and publishing the r
 To create a `my-project` directory using this template, run:
 
 ```sh
-$ npm init cloudflare my-project worker-rust
+$ npm init cloudflare my-project workers-tunnel
 # or
-$ yarn create cloudflare my-project worker-rust
+$ yarn create cloudflare my-project workers-tunnel
 # or
-$ pnpm create cloudflare my-project worker-rust
+$ pnpm create cloudflare my-project workers-tunnel
 ```
 
 > **Note:** Each command invokes [`create-cloudflare`](https://www.npmjs.com/package/create-cloudflare) for project creation.

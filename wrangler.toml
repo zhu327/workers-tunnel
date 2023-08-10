@@ -1,4 +1,4 @@
-name = "worker-rust"
+name = "workers-tunnel"
 main = "build/worker/shim.mjs"
 compatibility_date = "2023-03-22"
 

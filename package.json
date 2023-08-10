@@ -1,5 +1,5 @@
 {
-	"name": "template-worker-rust",
+	"name": "workers-tunnel",
 	"version": "0.0.0",
 	"private": true,
 	"scripts": {
