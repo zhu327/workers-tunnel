@@ -2,10 +2,11 @@ use crate::proxy::{parse_early_data, run_tunnel};
 use crate::websocket::WebSocketConnection;
 use worker::*;
 
-const CLIENT_ID: &str = "18ad2c9c-a88b-48e8-aa64-5dee0045c282";
-
 #[event(fetch)]
-async fn main(req: Request, _env: Env, _: Context) -> Result<Response> {
+async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
+    // get client id
+    let client_id = env.var("CLIENT_ID")?.to_string();
+
     // ready early data
     let early_data = req.headers().get("sec-websocket-protocol")?;
     let early_data = parse_early_data(early_data)?;
@@ -19,7 +20,20 @@ async fn main(req: Request, _env: Env, _: Context) -> Result<Response> {
         let event_stream = server.events().expect("could not open stream");
 
         let socket = WebSocketConnection::new(&server, event_stream, early_data);
-        run_tunnel(socket).await.unwrap_or_default();
+
+        // run vless tunnel
+        match run_tunnel(socket, &client_id).await {
+            Err(err) => {
+                if err.kind() == std::io::ErrorKind::InvalidData
+                    || err.kind() == std::io::ErrorKind::ConnectionAborted
+                {
+                    server
+                        .close(Some(1003), Some("Unsupported data"))
+                        .unwrap_or_default()
+                }
+            }
+            _ => (),
+        }
     });
 
     Response::from_websocket(pair.client)
@@ -30,11 +44,9 @@ mod proxy {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use crate::websocket::WebSocketConnection;
-    use crate::CLIENT_ID;
     use base64::decode;
     use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
-    use worker::console_debug;
-    use worker::Socket;
+    use worker::{console_debug, Socket};
 
     pub fn parse_early_data(data: Option<String>) -> Result<Option<Vec<u8>>> {
         if let Some(data) = data {
@@ -48,7 +60,10 @@ mod proxy {
         Ok(None)
     }
 
-    pub async fn run_tunnel(mut server_socket: WebSocketConnection<'_>) -> Result<()> {
+    pub async fn run_tunnel(
+        mut server_socket: WebSocketConnection<'_>,
+        client_id: &str,
+    ) -> Result<()> {
         // process request
 
         // read version
@@ -57,7 +72,7 @@ mod proxy {
 
         if prefix[0] != 0 {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+                std::io::ErrorKind::InvalidData,
                 format!(
                     "invalid client protocol version, expected 0, got {}",
                     prefix[0]
@@ -67,10 +82,10 @@ mod proxy {
 
         // valid client id
         let target_id = &prefix[1..17];
-        for (b1, b2) in parse_hex(CLIENT_ID).iter().zip(target_id.iter()) {
+        for (b1, b2) in parse_hex(client_id).iter().zip(target_id.iter()) {
             if b1 != b2 {
                 return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                    std::io::ErrorKind::InvalidData,
                     "Unknown client id",
                 ));
             }
@@ -176,8 +191,6 @@ mod proxy {
                     e.to_string()
                 );
 
-                server_socket.close()?;
-
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::ConnectionAborted,
                     e.to_string(),
@@ -264,13 +277,6 @@ mod websocket {
                 stream,
                 buffer: buff,
             }
-        }
-
-        pub fn close(self) -> Result<()> {
-            return match self.ws.close(Some(1000), Some("Normal close")) {
-                Ok(()) => Ok(()),
-                Err(e) => Err(Error::new(ErrorKind::Other, e.to_string())),
-            };
         }
     }
 
