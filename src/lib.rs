@@ -49,6 +49,9 @@ mod proxy {
     }
 
     pub async fn run_tunnel(mut server_socket: WebSocketConnection<'_>) -> Result<()> {
+        // process request
+
+        // read version
         let mut prefix = [0u8; 18];
         server_socket.read_exact(&mut prefix).await?;
 
@@ -62,6 +65,7 @@ mod proxy {
             ));
         }
 
+        // valid client id
         let target_id = &prefix[1..17];
         for (b1, b2) in parse_hex(CLIENT_ID).iter().zip(target_id.iter()) {
             if b1 != b2 {
@@ -79,6 +83,7 @@ mod proxy {
             server_socket.read_exact(&mut addon_bytes).await?;
         }
 
+        // parse remote address
         let mut address_prefix = [0u8; 4];
         server_socket.read_exact(&mut address_prefix).await?;
 
@@ -160,6 +165,7 @@ mod proxy {
             }
         };
 
+        // connect to remote socket
         let mut remote_socket = match Socket::builder().connect(remote_addr.clone(), port) {
             Ok(socket) => socket,
             Err(e) => {
@@ -170,7 +176,7 @@ mod proxy {
                     e.to_string()
                 );
 
-                server_socket.close();
+                server_socket.close()?;
 
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::ConnectionAborted,
@@ -260,10 +266,11 @@ mod websocket {
             }
         }
 
-        pub fn close(self) {
-            self.ws
-                .close(Some(1000), Some("Normal close"))
-                .unwrap_or(());
+        pub fn close(self) -> Result<()> {
+            return match self.ws.close(Some(1000), Some("Normal close")) {
+                Ok(()) => Ok(()),
+                Err(e) => Err(Error::new(ErrorKind::Other, e.to_string())),
+            };
         }
     }
 
@@ -275,32 +282,31 @@ mod websocket {
         ) -> Poll<Result<()>> {
             let this = self.project();
 
-            if buf.remaining() <= this.buffer.len() {
-                buf.put_slice(&this.buffer.split_to(buf.remaining()));
+            let amt = std::cmp::min(this.buffer.len(), buf.remaining());
+            if amt > 0 {
+                buf.put_slice(&this.buffer.split_to(amt));
                 return Poll::Ready(Ok(()));
             }
 
-            let item = futures_util::ready!(this.stream.poll_next(cx));
-            match item {
-                Some(Ok(WebsocketEvent::Message(msg))) => {
+            match this.stream.poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(WebsocketEvent::Message(msg)))) => {
                     if let Some(data) = msg.bytes() {
                         this.buffer.put_slice(&data);
 
-                        if buf.remaining() <= this.buffer.len() {
-                            buf.put_slice(&this.buffer.split_to(buf.remaining()));
-                        } else if buf.remaining() > this.buffer.len() {
-                            buf.put_slice(&this.buffer.split());
+                        let amt = std::cmp::min(this.buffer.len(), buf.remaining());
+                        if amt > 0 {
+                            buf.put_slice(&this.buffer.split_to(amt));
                         }
-
-                        return Poll::Ready(Ok(()));
                     };
-                    return Poll::Pending;
+                    return Poll::Ready(Ok(()));
                 }
-                Some(Ok(WebsocketEvent::Close(_))) => {
-                    Poll::Ready(Err(Error::new(ErrorKind::Other, "Connection closed")))
+                Poll::Ready(None) | Poll::Ready(Some(Ok(WebsocketEvent::Close(_)))) => {
+                    return Poll::Ready(Err(Error::new(ErrorKind::Other, "Connection closed")))
                 }
-                Some(Err(e)) => Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string()))),
-                None => Poll::Ready(Err(Error::new(ErrorKind::Other, "Connection closed"))),
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())))
+                }
             }
         }
     }
