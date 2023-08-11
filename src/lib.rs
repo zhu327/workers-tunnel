@@ -346,7 +346,7 @@ mod websocket {
 
         fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
             let this = self.project();
-            match this.ws.close(Some(1000), Some("Normal close")) {
+            match this.ws.close(None, Some("Normal close")) {
                 Ok(()) => Poll::Ready(Ok(())),
                 Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string()))),
             }
