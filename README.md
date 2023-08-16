@@ -106,11 +106,11 @@ Please refer to the following documentation for development and deployment.
 
 <https://developers.cloudflare.com/workers/runtime-apis/webassembly/rust/>
 
-**Important**: Before deployment, you need to modify the `vars` configuration in `wrangler.toml` and change `CLIENT_ID` to your UUID.
+**Important**: Before deployment, you need to modify the `vars` configuration in `wrangler.toml` and change `USER_ID` to your UUID.
 
 ```toml
 [vars]
-CLIENT_ID = "c55ba35f-12f6-436e-a451-4ce982c4ec1c"
+USER_ID = "c55ba35f-12f6-436e-a451-4ce982c4ec1c"
 ```
 
 ## Setup

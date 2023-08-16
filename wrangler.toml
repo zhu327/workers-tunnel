@@ -6,4 +6,4 @@ compatibility_date = "2023-03-22"
 command = "cargo install -q worker-build && worker-build --release"
 
 [vars]
-CLIENT_ID = "c55ba35f-12f6-436e-a451-4ce982c4ec1c"
+USER_ID = "c55ba35f-12f6-436e-a451-4ce982c4ec1c"

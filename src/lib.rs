@@ -4,8 +4,8 @@ use worker::*;
 
 #[event(fetch)]
 async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
-    // get client id
-    let client_id = env.var("CLIENT_ID")?.to_string();
+    // get user id
+    let user_id = env.var("USER_ID")?.to_string();
 
     // ready early data
     let early_data = req.headers().get("sec-websocket-protocol")?;
@@ -22,7 +22,7 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
         let socket = WebSocketConnection::new(&server, event_stream, early_data);
 
         // run vless tunnel
-        match run_tunnel(socket, &client_id).await {
+        match run_tunnel(socket, &user_id).await {
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::InvalidData
                     || err.kind() == std::io::ErrorKind::ConnectionAborted
@@ -63,7 +63,7 @@ mod proxy {
 
     pub async fn run_tunnel(
         mut server_socket: WebSocketConnection<'_>,
-        client_id: &str,
+        user_id: &str,
     ) -> Result<()> {
         // process request
 
@@ -81,13 +81,13 @@ mod proxy {
             ));
         }
 
-        // valid client id
+        // valid user id
         let target_id = &prefix[1..17];
-        for (b1, b2) in parse_hex(client_id).iter().zip(target_id.iter()) {
+        for (b1, b2) in parse_hex(user_id).iter().zip(target_id.iter()) {
             if b1 != b2 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "Unknown client id",
+                    "Unknown user id",
                 ));
             }
         }
