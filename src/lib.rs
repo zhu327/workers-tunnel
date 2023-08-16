@@ -199,15 +199,6 @@ mod proxy {
             }
         };
 
-        {
-            // first write, normal is tls client hello
-            let mut buffer: [u8; 2048] = [0; 2048];
-            let n = server_socket.read(&mut buffer).await?;
-            if n > 0 {
-                remote_socket.write_all(&buffer[..n]).await?;
-            }
-        }
-
         // write response
         server_socket
             .write(&[
