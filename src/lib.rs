@@ -44,13 +44,14 @@ mod proxy {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use crate::websocket::WebSocketConnection;
-    use base64::decode;
+    use base64_url::decode;
     use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
     use worker::{console_debug, Socket};
 
     pub fn parse_early_data(data: Option<String>) -> Result<Option<Vec<u8>>> {
         if let Some(data) = data {
             if data.len() > 0 {
+                let data = data.replace("+", "-").replace("/", "_").replace("=", "");
                 match decode(&data) {
                     Ok(early_data) => return Ok(Some(early_data)),
                     Err(err) => return Err(Error::new(ErrorKind::Other, err)),
