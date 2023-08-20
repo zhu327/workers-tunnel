@@ -46,8 +46,6 @@ Replace the domain `your.domain.workers.dev` in the following configuration with
             "users": [
               {
                 "id": "c55ba35f-12f6-436e-a451-4ce982c4ec1c",
-                "level": 0,
-                "flow": "",
                 "encryption": "none"
               }
             ],
