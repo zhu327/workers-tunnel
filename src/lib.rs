@@ -45,7 +45,7 @@ mod proxy {
 
     use crate::websocket::WebSocketConnection;
     use base64_url::decode;
-    use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{copy_bidirectional, AsyncReadExt};
     use worker::{console_debug, Socket};
 
     pub fn parse_early_data(data: Option<String>) -> Result<Option<Vec<u8>>> {
@@ -199,14 +199,6 @@ mod proxy {
             }
         };
 
-        // write response
-        server_socket
-            .write(&[
-                0u8, // version
-                0u8, // addons length
-            ])
-            .await?;
-
         copy_bidirectional(&mut server_socket, &mut remote_socket).await?;
 
         Ok(())
@@ -260,6 +252,7 @@ mod websocket {
         #[pin]
         stream: EventStream<'a>,
         buffer: BytesMut,
+        write_init: bool,
     }
 
     impl<'a> WebSocketConnection<'a> {
@@ -277,6 +270,7 @@ mod websocket {
                 ws,
                 stream,
                 buffer: buff,
+                write_init: true,
             }
         }
     }
@@ -325,7 +319,19 @@ mod websocket {
             buf: &[u8],
         ) -> Poll<Result<usize>> {
             let this = self.project();
+            if *this.write_init {
+                // 发送第一个包时需要加上 vless 的协议 response 头
+                *this.write_init = false;
 
+                return match this
+                    .ws
+                    .send_with_bytes([&[0u8, 0u8], buf].concat().to_vec().as_slice())
+                {
+                    Ok(()) => Poll::Ready(Ok(buf.len())),
+                    Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string()))),
+                };
+            }
+ 
             match this.ws.send_with_bytes(buf) {
                 Ok(()) => Poll::Ready(Ok(buf.len())),
                 Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string()))),
