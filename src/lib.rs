@@ -252,7 +252,7 @@ mod websocket {
         #[pin]
         stream: EventStream<'a>,
         buffer: BytesMut,
-        write_init: bool,
+        init_write: bool,
     }
 
     impl<'a> WebSocketConnection<'a> {
@@ -270,7 +270,7 @@ mod websocket {
                 ws,
                 stream,
                 buffer: buff,
-                write_init: true,
+                init_write: false,
             }
         }
     }
@@ -319,9 +319,9 @@ mod websocket {
             buf: &[u8],
         ) -> Poll<Result<usize>> {
             let this = self.project();
-            if *this.write_init {
+            if !*this.init_write {
                 // 发送第一个包时需要加上 vless 的协议 response 头
-                *this.write_init = false;
+                *this.init_write = true;
 
                 return match this
                     .ws
