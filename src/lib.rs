@@ -54,7 +54,7 @@ mod proxy {
                 let data = data.replace("+", "-").replace("/", "_").replace("=", "");
                 match decode(&data) {
                     Ok(early_data) => return Ok(Some(early_data)),
-                    Err(err) => return Err(Error::new(ErrorKind::Other, err)),
+                    Err(err) => return Err(Error::new(ErrorKind::Other, "unsupport early data")),
                 }
             }
         }
