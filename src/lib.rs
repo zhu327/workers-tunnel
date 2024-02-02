@@ -30,6 +30,7 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
                     .close(Some(1003), Some("invalid request"))
                     .unwrap_or_default()
             }
+            console_debug!("run tunnel error: {}", err);
         }
     });
 
@@ -287,8 +288,12 @@ mod websocket {
                     };
                     Poll::Ready(Ok(()))
                 }
-                Poll::Ready(None) => Poll::Ready(Ok(())),
-                _ => Poll::Ready(Err(Error::new(ErrorKind::Other, "read error"))),
+                Poll::Ready(None) | Poll::Ready(Some(Ok(WebsocketEvent::Close(_)))) => {
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())))
+                }
             }
         }
     }
