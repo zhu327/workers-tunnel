@@ -22,17 +22,14 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
         let socket = WebSocketStream::new(&server, event_stream, early_data);
 
         // run vless tunnel
-        match run_tunnel(socket, &user_id).await {
-            Err(err) => {
-                if err.kind() == std::io::ErrorKind::InvalidData
-                    || err.kind() == std::io::ErrorKind::ConnectionAborted
-                {
-                    server
-                        .close(Some(1003), Some("invalid request"))
-                        .unwrap_or_default()
-                }
+        if let Err(err) = run_tunnel(socket, &user_id).await {
+            if err.kind() == std::io::ErrorKind::InvalidData
+                || err.kind() == std::io::ErrorKind::ConnectionAborted
+            {
+                server
+                    .close(Some(1003), Some("invalid request"))
+                    .unwrap_or_default()
             }
-            _ => (),
         }
     });
 
@@ -50,9 +47,9 @@ mod proxy {
 
     pub fn parse_early_data(data: Option<String>) -> Result<Option<Vec<u8>>> {
         if let Some(data) = data {
-            if data.len() > 0 {
+            if !data.is_empty() {
                 let s = data.replace('-', "+").replace('_', "/");
-                match decode_config(&s, URL_SAFE_NO_PAD) {
+                match decode_config(s, URL_SAFE_NO_PAD) {
                     Ok(early_data) => return Ok(Some(early_data)),
                     Err(err) => return Err(Error::new(ErrorKind::Other, err.to_string())),
                 }
@@ -92,7 +89,7 @@ mod proxy {
         {
             // ignore addons
             let addon_length = prefix[17];
-            let mut addon_bytes = allocate_vec(addon_length as usize).into_boxed_slice();
+            let mut addon_bytes = vec![0; addon_length as usize].into_boxed_slice();
             client_socket.read_exact(&mut addon_bytes).await?;
         }
 
@@ -139,7 +136,7 @@ mod proxy {
                 let mut domain_name_len = [0u8; 1];
                 client_socket.read_exact(&mut domain_name_len).await?;
 
-                let mut domain_name_bytes = allocate_vec(domain_name_len[0] as usize);
+                let mut domain_name_bytes = vec![0; domain_name_len[0] as usize];
                 client_socket.read_exact(&mut domain_name_bytes).await?;
 
                 let address_str = match std::str::from_utf8(&domain_name_bytes) {
@@ -168,7 +165,7 @@ mod proxy {
                     ((address_bytes[12] as u16) << 8) | (address_bytes[13] as u16),
                     ((address_bytes[14] as u16) << 8) | (address_bytes[15] as u16),
                 );
-                format!("[{}]", v6addr.to_string())
+                format!("[{}]", v6addr)
             }
             invalid_type => {
                 return Err(std::io::Error::new(
@@ -218,15 +215,6 @@ mod proxy {
             bytes.push(h << 4 | l)
         }
         bytes.into_boxed_slice()
-    }
-
-    #[inline]
-    fn allocate_vec<T>(len: usize) -> Vec<T> {
-        let mut ret = Vec::with_capacity(len);
-        unsafe {
-            ret.set_len(len);
-        }
-        ret
     }
 }
 
