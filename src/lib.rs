@@ -1,5 +1,5 @@
 use crate::proxy::{parse_early_data, run_tunnel};
-use crate::websocket::WebSocketConnection;
+use crate::websocket::WebSocketStream;
 use worker::*;
 
 #[event(fetch)]
@@ -19,7 +19,7 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
     wasm_bindgen_futures::spawn_local(async move {
         let event_stream = server.events().expect("could not open stream");
 
-        let socket = WebSocketConnection::new(&server, event_stream, early_data);
+        let socket = WebSocketStream::new(&server, event_stream, early_data);
 
         // run vless tunnel
         match run_tunnel(socket, &user_id).await {
@@ -43,7 +43,7 @@ mod proxy {
     use std::io::{Error, ErrorKind, Result};
     use std::net::{Ipv4Addr, Ipv6Addr};
 
-    use crate::websocket::WebSocketConnection;
+    use crate::websocket::WebSocketStream;
     use base64::{decode_config, URL_SAFE_NO_PAD};
     use tokio::io::{copy_bidirectional, AsyncReadExt};
     use worker::{console_debug, Socket};
@@ -61,10 +61,7 @@ mod proxy {
         Ok(None)
     }
 
-    pub async fn run_tunnel(
-        mut client_socket: WebSocketConnection<'_>,
-        user_id: &str,
-    ) -> Result<()> {
+    pub async fn run_tunnel(mut client_socket: WebSocketStream<'_>, user_id: &str) -> Result<()> {
         // process request
 
         // read version
@@ -247,15 +244,15 @@ mod websocket {
     use worker::{EventStream, WebSocket, WebsocketEvent};
 
     #[pin_project]
-    pub struct WebSocketConnection<'a> {
+    pub struct WebSocketStream<'a> {
         ws: &'a WebSocket,
         #[pin]
         stream: EventStream<'a>,
         buffer: BytesMut,
-        init_write: bool,
+        init_state: bool,
     }
 
-    impl<'a> WebSocketConnection<'a> {
+    impl<'a> WebSocketStream<'a> {
         pub fn new(
             ws: &'a WebSocket,
             stream: EventStream<'a>,
@@ -270,12 +267,12 @@ mod websocket {
                 ws,
                 stream,
                 buffer: buff,
-                init_write: false,
+                init_state: true,
             }
         }
     }
 
-    impl<'a> AsyncRead for WebSocketConnection<'a> {
+    impl<'a> AsyncRead for WebSocketStream<'a> {
         fn poll_read(
             self: Pin<&mut Self>,
             cx: &mut Context<'_>,
@@ -308,16 +305,16 @@ mod websocket {
         }
     }
 
-    impl<'a> AsyncWrite for WebSocketConnection<'a> {
+    impl<'a> AsyncWrite for WebSocketStream<'a> {
         fn poll_write(
             self: Pin<&mut Self>,
             _: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<Result<usize>> {
             let this = self.project();
-            if !*this.init_write {
+            if *this.init_state {
                 // 发送第一个包时需要加上 vless 的协议 response 头
-                *this.init_write = true;
+                *this.init_state = false;
 
                 return match this
                     .ws
