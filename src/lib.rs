@@ -51,7 +51,7 @@ mod proxy {
     pub fn parse_early_data(data: Option<String>) -> Result<Option<Vec<u8>>> {
         if let Some(data) = data {
             if data.len() > 0 {
-                let s = data.replace("+", "-").replace("/", "_").replace("=", "");
+                let s = data.replace('-', "+").replace('_', "/");
                 match decode_config(&s, URL_SAFE_NO_PAD) {
                     Ok(early_data) => return Ok(Some(early_data)),
                     Err(err) => return Err(Error::new(ErrorKind::Other, err.to_string())),
