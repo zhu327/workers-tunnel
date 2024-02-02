@@ -8,8 +8,8 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
     let user_id = env.var("USER_ID")?.to_string();
 
     // ready early data
-    let early_data = req.headers().get("sec-websocket-protocol")?;
-    let early_data = parse_early_data(early_data)?;
+    let swp = req.headers().get("sec-websocket-protocol")?;
+    let early_data = parse_early_data(swp)?;
 
     // Accept / handle a websocket connection
     let pair = WebSocketPair::new()?;
@@ -44,17 +44,17 @@ mod proxy {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use crate::websocket::WebSocketConnection;
-    use base64_url::decode;
+    use base64::{decode_config, URL_SAFE_NO_PAD};
     use tokio::io::{copy_bidirectional, AsyncReadExt};
     use worker::{console_debug, Socket};
 
     pub fn parse_early_data(data: Option<String>) -> Result<Option<Vec<u8>>> {
         if let Some(data) = data {
             if data.len() > 0 {
-                let data = data.replace("+", "-").replace("/", "_").replace("=", "");
-                match decode(&data) {
+                let s = data.replace("+", "-").replace("/", "_").replace("=", "");
+                match decode_config(&s, URL_SAFE_NO_PAD) {
                     Ok(early_data) => return Ok(Some(early_data)),
-                    Err(_) => return Err(Error::new(ErrorKind::Other, "unsupported early data")),
+                    Err(err) => return Err(Error::new(ErrorKind::Other, err.to_string())),
                 }
             }
         }
@@ -261,7 +261,7 @@ mod websocket {
             stream: EventStream<'a>,
             early_data: Option<Vec<u8>>,
         ) -> Self {
-            let mut buff = BytesMut::with_capacity(4096);
+            let mut buff = BytesMut::new();
             if let Some(data) = early_data {
                 buff.put_slice(&data)
             }
@@ -290,7 +290,7 @@ mod websocket {
             }
 
             match this.stream.poll_next(cx) {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => Poll::Pending,
                 Poll::Ready(Some(Ok(WebsocketEvent::Message(msg)))) => {
                     if let Some(data) = msg.bytes() {
                         this.buffer.put_slice(&data);
@@ -300,14 +300,10 @@ mod websocket {
                             buf.put_slice(&this.buffer.split_to(amt));
                         }
                     };
-                    return Poll::Ready(Ok(()));
+                    Poll::Ready(Ok(()))
                 }
-                Poll::Ready(None) | Poll::Ready(Some(Ok(WebsocketEvent::Close(_)))) => {
-                    return Poll::Ready(Err(Error::new(ErrorKind::Other, "Connection closed")))
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())))
-                }
+                Poll::Ready(None) => Poll::Ready(Ok(())),
+                _ => Poll::Ready(Err(Error::new(ErrorKind::Other, "read error"))),
             }
         }
     }
@@ -331,7 +327,7 @@ mod websocket {
                     Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string()))),
                 };
             }
- 
+
             match this.ws.send_with_bytes(buf) {
                 Ok(()) => Poll::Ready(Ok(buf.len())),
                 Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string()))),
