@@ -28,7 +28,7 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
                     || err.kind() == std::io::ErrorKind::ConnectionAborted
                 {
                     server
-                        .close(Some(1003), Some("Unsupported data"))
+                        .close(Some(1003), Some("invalid request"))
                         .unwrap_or_default()
                 }
             }
@@ -62,14 +62,14 @@ mod proxy {
     }
 
     pub async fn run_tunnel(
-        mut server_socket: WebSocketConnection<'_>,
+        mut client_socket: WebSocketConnection<'_>,
         user_id: &str,
     ) -> Result<()> {
         // process request
 
         // read version
         let mut prefix = [0u8; 18];
-        server_socket.read_exact(&mut prefix).await?;
+        client_socket.read_exact(&mut prefix).await?;
 
         if prefix[0] != 0 {
             return Err(std::io::Error::new(
@@ -87,7 +87,7 @@ mod proxy {
             if b1 != b2 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "Unknown user id",
+                    "invalid user id",
                 ));
             }
         }
@@ -96,12 +96,12 @@ mod proxy {
             // ignore addons
             let addon_length = prefix[17];
             let mut addon_bytes = allocate_vec(addon_length as usize).into_boxed_slice();
-            server_socket.read_exact(&mut addon_bytes).await?;
+            client_socket.read_exact(&mut addon_bytes).await?;
         }
 
         // parse remote address
         let mut address_prefix = [0u8; 4];
-        server_socket.read_exact(&mut address_prefix).await?;
+        client_socket.read_exact(&mut address_prefix).await?;
 
         match address_prefix[0] {
             1 => {
@@ -116,7 +116,7 @@ mod proxy {
             unknown_protocol_type => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Unknown requested protocol: {}", unknown_protocol_type),
+                    format!("invalid requested protocol: {}", unknown_protocol_type),
                 ));
             }
         }
@@ -127,7 +127,7 @@ mod proxy {
             1 => {
                 // 4 byte ipv4 address
                 let mut address_bytes = [0u8; 4];
-                server_socket.read_exact(&mut address_bytes).await?;
+                client_socket.read_exact(&mut address_bytes).await?;
 
                 let v4addr: Ipv4Addr = Ipv4Addr::new(
                     address_bytes[0],
@@ -140,17 +140,17 @@ mod proxy {
             2 => {
                 // domain name
                 let mut domain_name_len = [0u8; 1];
-                server_socket.read_exact(&mut domain_name_len).await?;
+                client_socket.read_exact(&mut domain_name_len).await?;
 
                 let mut domain_name_bytes = allocate_vec(domain_name_len[0] as usize);
-                server_socket.read_exact(&mut domain_name_bytes).await?;
+                client_socket.read_exact(&mut domain_name_bytes).await?;
 
                 let address_str = match std::str::from_utf8(&domain_name_bytes) {
                     Ok(s) => s,
                     Err(e) => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("Failed to decode address: {}", e),
+                            format!("invalid address: {}", e),
                         ));
                     }
                 };
@@ -159,7 +159,7 @@ mod proxy {
             3 => {
                 // 16 byte ipv6 address
                 let mut address_bytes = [0u8; 16];
-                server_socket.read_exact(&mut address_bytes).await?;
+                client_socket.read_exact(&mut address_bytes).await?;
 
                 let v6addr = Ipv6Addr::new(
                     ((address_bytes[0] as u16) << 8) | (address_bytes[1] as u16),
@@ -176,7 +176,7 @@ mod proxy {
             invalid_type => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Invalid address type: {}", invalid_type),
+                    format!("invalid address type: {}", invalid_type),
                 ));
             }
         };
@@ -199,7 +199,7 @@ mod proxy {
             }
         };
 
-        copy_bidirectional(&mut server_socket, &mut remote_socket).await?;
+        copy_bidirectional(&mut client_socket, &mut remote_socket).await?;
 
         Ok(())
     }
@@ -340,7 +340,7 @@ mod websocket {
 
         fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
             let this = self.project();
-            match this.ws.close(None, Some("Normal close")) {
+            match this.ws.close(None, Some("normal close")) {
                 Ok(()) => Poll::Ready(Ok(())),
                 Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string()))),
             }
