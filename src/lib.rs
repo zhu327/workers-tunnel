@@ -301,15 +301,20 @@ mod websocket {
         ) -> Poll<Result<usize>> {
             let this = self.project();
 
-            let bytes_to_send = if *this.init_state {
-                // If it's the first write, prepend the VLESS protocol response header
+            if *this.init_state {
+                // 发送第一个包时需要加上 vless 的协议 response 头
                 *this.init_state = false;
-                [&[0u8, 0u8], buf].concat().to_vec()
-            } else {
-                buf.to_vec()
-            };
 
-            match this.ws.send_with_bytes(&bytes_to_send) {
+                return match this
+                    .ws
+                    .send_with_bytes([&[0u8, 0u8], buf].concat().to_vec().as_slice())
+                {
+                    Ok(()) => Poll::Ready(Ok(buf.len())),
+                    Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string()))),
+                };
+            }
+
+            match this.ws.send_with_bytes(buf) {
                 Ok(()) => Poll::Ready(Ok(buf.len())),
                 Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string()))),
             }
