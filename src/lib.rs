@@ -267,32 +267,27 @@ mod websocket {
             cx: &mut Context<'_>,
             buf: &mut ReadBuf<'_>,
         ) -> Poll<Result<()>> {
-            let this = self.project();
+            let mut this = self.project();
 
-            let amt = std::cmp::min(this.buffer.len(), buf.remaining());
-            if amt > 0 {
-                buf.put_slice(&this.buffer.split_to(amt));
-                return Poll::Ready(Ok(()));
-            }
-
-            match this.stream.poll_next(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Some(Ok(WebsocketEvent::Message(msg)))) => {
-                    if let Some(data) = msg.bytes() {
-                        this.buffer.put_slice(&data);
-
-                        let amt = std::cmp::min(this.buffer.len(), buf.remaining());
-                        if amt > 0 {
-                            buf.put_slice(&this.buffer.split_to(amt));
-                        }
-                    };
-                    Poll::Ready(Ok(()))
+            loop {
+                let amt = std::cmp::min(this.buffer.len(), buf.remaining());
+                if amt > 0 {
+                    buf.put_slice(&this.buffer.split_to(amt));
+                    return Poll::Ready(Ok(()));
                 }
-                Poll::Ready(None) | Poll::Ready(Some(Ok(WebsocketEvent::Close(_)))) => {
-                    Poll::Ready(Ok(()))
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())))
+
+                match this.stream.as_mut().poll_next(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Some(Ok(WebsocketEvent::Message(msg)))) => {
+                        if let Some(data) = msg.bytes() {
+                            this.buffer.put_slice(&data);
+                        };
+                        continue;
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())))
+                    }
+                    _ => return Poll::Ready(Ok(())), // None or Close event, return Ok to indicate stream end
                 }
             }
         }
@@ -305,20 +300,16 @@ mod websocket {
             buf: &[u8],
         ) -> Poll<Result<usize>> {
             let this = self.project();
-            if *this.init_state {
-                // 发送第一个包时需要加上 vless 的协议 response 头
+
+            let bytes_to_send = if *this.init_state {
+                // If it's the first write, prepend the VLESS protocol response header
                 *this.init_state = false;
+                [&[0u8, 0u8], buf].concat().to_vec()
+            } else {
+                buf.to_vec()
+            };
 
-                return match this
-                    .ws
-                    .send_with_bytes([&[0u8, 0u8], buf].concat().to_vec().as_slice())
-                {
-                    Ok(()) => Poll::Ready(Ok(buf.len())),
-                    Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string()))),
-                };
-            }
-
-            match this.ws.send_with_bytes(buf) {
+            match this.ws.send_with_bytes(&bytes_to_send) {
                 Ok(()) => Poll::Ready(Ok(buf.len())),
                 Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string()))),
             }
