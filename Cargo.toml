@@ -11,12 +11,16 @@ wasm-opt = false
 crate-type = ["cdylib"]
 
 [dependencies]
-worker = "0.0.18"
+worker = "0.3.0"
 tokio = { version = "1.28", features = ["io-util"] }
 pin-project = "1.1.0"
 futures-util = { version = "0.3.28", default-features = false }
 base64 = "0.13.0"
 bytes = "1.4.0"
+uuid = "1.9.1"
+ipnetwork = "0.20.0"
+reqwest = "0.12.5"
+serde_json = "1.0"
 
 [profile.release]
 lto = true

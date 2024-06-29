@@ -7,3 +7,4 @@ command = "cargo install -q worker-build && worker-build --release"
 
 [vars]
 USER_ID = "c55ba35f-12f6-436e-a451-4ce982c4ec1c"
+PROXY_IP = "cf-sg.mocn.top"
