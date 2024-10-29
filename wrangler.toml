@@ -5,5 +5,10 @@ compatibility_date = "2024-09-02"
 [build]
 command = "cargo install -q worker-build && worker-build --release"
 
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 [vars]
 USER_ID = "c55ba35f-12f6-436e-a451-4ce982c4ec1c"
+PROXY_IP = ""
