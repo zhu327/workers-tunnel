@@ -16,6 +16,20 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
         .map(|s| s.to_string())
         .collect::<Vec<String>>();
 
+    // better disguising
+    let fallback_site = match env.var("FALLBACK_SITE") {
+        Ok(f) => f.to_string(),
+        Err(_) => String::from(""),
+    };
+    let should_fallback = match req.headers().get("Upgrade")? {
+        Some(up) => up != *"websocket",
+        None => true,
+    };
+    if should_fallback && !fallback_site.is_empty() {
+        let req = Fetch::Url(Url::parse(&fallback_site)?);
+        return req.send().await;
+    }
+
     // ready early data
     let early_data = req.headers().get("sec-websocket-protocol")?;
     let early_data = parse_early_data(early_data)?;
