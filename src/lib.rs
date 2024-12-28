@@ -20,6 +20,16 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
     let early_data = req.headers().get("sec-websocket-protocol")?;
     let early_data = parse_early_data(early_data)?;
 
+    let fallback_site = match env.var("FALLBACK_SITE") {
+        Ok(d) => d.to_string(),
+        Err(_) => String::from(""),
+    };
+    if early_data.is_none() && !fallback_site.is_empty() {
+        let req = Fetch::Url(Url::parse(&fallback_site)?);
+        let resp = req.send().await?;
+        return Ok(resp);
+    }
+
     // Accept / handle a websocket connection
     let WebSocketPair { client, server } = WebSocketPair::new()?;
     server.accept()?;
