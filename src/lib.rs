@@ -94,7 +94,7 @@ mod proxy {
 
         let mut bytes = Vec::new();
         while let (Some(h), Some(l)) = (hex_bytes.next(), hex_bytes.next()) {
-            bytes.push(h << 4 | l)
+            bytes.push((h << 4) | l)
         }
         bytes
     }
@@ -146,7 +146,7 @@ mod proxy {
         match network_type {
             protocol::NETWORK_TYPE_TCP => {
                 // try to connect to remote
-                for target in vec![vec![remote_addr], proxy_ip].concat() {
+                for target in [vec![remote_addr], proxy_ip].concat() {
                     match process_tcp_outbound(&mut client_socket, &target, remote_port).await {
                         Ok(_) => {
                             // normal closed
@@ -249,7 +249,7 @@ mod proxy {
         loop {
             // read packet length
             let length = client_socket.read_u16().await;
-            if let Err(_) = length {
+            if length.is_err() {
                 return Ok(());
             }
 
@@ -360,7 +360,7 @@ mod websocket {
         }
     }
 
-    impl<'a> AsyncRead for WebSocketStream<'a> {
+    impl AsyncRead for WebSocketStream<'_> {
         fn poll_read(
             self: Pin<&mut Self>,
             cx: &mut Context<'_>,
@@ -392,7 +392,7 @@ mod websocket {
         }
     }
 
-    impl<'a> AsyncWrite for WebSocketStream<'a> {
+    impl AsyncWrite for WebSocketStream<'_> {
         fn poll_write(
             self: Pin<&mut Self>,
             _: &mut Context<'_>,
