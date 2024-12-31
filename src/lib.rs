@@ -1,5 +1,6 @@
 use crate::proxy::{parse_early_data, parse_user_id, run_tunnel};
 use crate::websocket::WebSocketStream;
+use wasm_bindgen::JsValue;
 use worker::*;
 
 #[event(fetch)]
@@ -16,15 +17,16 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
         .map(|s| s.to_string())
         .collect::<Vec<String>>();
 
-    // better disguising
-    let fallback_site = match env.var("FALLBACK_SITE") {
-        Ok(f) => f.to_string(),
-        Err(_) => String::from(""),
-    };
-    let should_fallback = match req.headers().get("Upgrade")? {
-        Some(up) => up != *"websocket",
-        None => true,
-    };
+    // better disguising;
+    let fallback_site = env
+        .var("FALLBACK_SITE")
+        .unwrap_or(JsValue::from_str("").into())
+        .to_string();
+    let should_fallback = req
+        .headers()
+        .get("Upgrade")?
+        .map(|up| up != *"websocket")
+        .unwrap_or(true);
     if should_fallback && !fallback_site.is_empty() {
         let req = Fetch::Url(Url::parse(&fallback_site)?);
         return req.send().await;
