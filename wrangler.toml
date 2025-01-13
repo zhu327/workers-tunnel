@@ -10,5 +10,6 @@ enabled = true
 head_sampling_rate = 1
 
 [vars]
-USER_ID = "c55ba35f-12f6-436e-a451-4ce982c4ec1c"
-PROXY_IP = ""
+USER_ID = "c55ba35f-12f6-436e-a451-4ce982c4ec1c" # your uuid
+PROXY_IP = "" # proxyip.fxxk.dedyn.io
+FALLBACK_SITE = "" # https://httpbin.org/status/404
