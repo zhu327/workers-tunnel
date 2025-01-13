@@ -27,6 +27,19 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
         .get("Upgrade")?
         .map(|up| up != *"websocket")
         .unwrap_or(true);
+    // show uri
+    let show_uri = env.var("SHOW_URI")?.to_string().parse().unwrap_or(false);
+    let request_path = req.path().to_string();
+    let uuid_str = env.var("USER_ID")?.to_string();
+    let domain_str = req.headers().get("Host")?.unwrap();
+    if should_fallback && show_uri && request_path.contains(uuid_str.as_str()) {
+        let vless_uri = format!(
+            "vless://{uuid}@{domain}:443?encryption=none&security=tls&sni={domain}&fp=chrome&type=ws&host={domain}&path=ws#workers-tunnel",
+            uuid = uuid_str,
+            domain = domain_str
+        );
+        return Response::ok(vless_uri);
+    }
     if should_fallback && !fallback_site.is_empty() {
         let req = Fetch::Url(Url::parse(&fallback_site)?);
         return req.send().await;
