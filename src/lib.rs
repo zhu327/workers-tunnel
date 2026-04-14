@@ -57,12 +57,17 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
     server.accept()?;
 
     wasm_bindgen_futures::spawn_local(async move {
+        let events = match server.events() {
+            Ok(events) => events,
+            Err(err) => {
+                console_error!("error: could not open websocket stream: {}", err);
+                _ = server.close(Some(1011), Some("websocket stream error"));
+                return;
+            }
+        };
+
         // create websocket stream
-        let socket = WebSocketStream::new(
-            &server,
-            server.events().expect("could not open stream"),
-            early_data,
-        );
+        let socket = WebSocketStream::new(&server, events, early_data);
 
         // into tunnel
         if let Err(err) = run_tunnel(socket, user_id, proxy_ip).await {
@@ -91,13 +96,25 @@ mod protocol {
 mod proxy {
     use std::io::{Error, ErrorKind, Result};
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::time::Duration;
 
     use crate::ext::StreamExt;
     use crate::protocol;
     use crate::websocket::WebSocketStream;
     use base64::{decode_config, URL_SAFE_NO_PAD};
-    use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+    use futures_util::future::{select, Either};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use worker::*;
+
+    const COPY_BUF_SIZE: usize = 64 * 1024;
+
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    struct TunnelRequest {
+        network_type: u8,
+        remote_port: u16,
+        remote_addr: String,
+    }
 
     pub fn parse_early_data(data: Option<String>) -> Result<Option<Vec<u8>>> {
         if let Some(data) = data {
@@ -136,6 +153,63 @@ mod proxy {
         user_id: Vec<u8>,
         proxy_ip: Vec<String>,
     ) -> Result<()> {
+        let request = match select(
+            Box::pin(read_tunnel_request(&mut client_socket, &user_id)),
+            Box::pin(Delay::from(HANDSHAKE_TIMEOUT)),
+        )
+        .await
+        {
+            Either::Left((result, _)) => result?,
+            Either::Right((_, _)) => {
+                return Err(Error::new(
+                    ErrorKind::TimedOut,
+                    "tunnel handshake timed out",
+                ));
+            }
+        };
+
+        // process outbound
+        match request.network_type {
+            protocol::NETWORK_TYPE_TCP => {
+                let mut last_error = None;
+
+                // try the requested address first, then configured proxy IPs
+                for target in [vec![request.remote_addr], proxy_ip].concat() {
+                    match process_tcp_outbound(&mut client_socket, &target, request.remote_port)
+                        .await
+                    {
+                        Ok(_) => return Ok(()),
+                        Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+                            last_error = Some(e);
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                Err(last_error.unwrap_or_else(|| {
+                    Error::new(ErrorKind::ConnectionRefused, "no target to connect")
+                }))
+            }
+            protocol::NETWORK_TYPE_UDP => {
+                process_udp_outbound(
+                    &mut client_socket,
+                    &request.remote_addr,
+                    request.remote_port,
+                )
+                .await
+            }
+            unknown => Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("unsupported network type: {}", unknown),
+            )),
+        }
+    }
+
+    async fn read_tunnel_request(
+        client_socket: &mut WebSocketStream<'_>,
+        user_id: &[u8],
+    ) -> Result<TunnelRequest> {
         // read version
         if client_socket.read_u8().await? != protocol::VERSION {
             return Err(Error::new(ErrorKind::InvalidData, "invalid version"));
@@ -174,38 +248,11 @@ mod proxy {
             }
         };
 
-        // process outbound
-        match network_type {
-            protocol::NETWORK_TYPE_TCP => {
-                // try to connect to remote
-                for target in [vec![remote_addr], proxy_ip].concat() {
-                    match process_tcp_outbound(&mut client_socket, &target, remote_port).await {
-                        Ok(_) => {
-                            // normal closed
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            // connection reset
-                            if e.kind() != ErrorKind::ConnectionReset {
-                                return Err(e);
-                            }
-
-                            // continue to next target
-                            continue;
-                        }
-                    }
-                }
-
-                Err(Error::new(ErrorKind::InvalidData, "no target to connect"))
-            }
-            protocol::NETWORK_TYPE_UDP => {
-                process_udp_outbound(&mut client_socket, &remote_addr, remote_port).await
-            }
-            unknown => Err(Error::new(
-                ErrorKind::InvalidData,
-                format!("unsupported network type: {}", unknown),
-            )),
-        }
+        Ok(TunnelRequest {
+            network_type,
+            remote_port,
+            remote_addr,
+        })
     }
 
     async fn process_tcp_outbound(
@@ -216,7 +263,7 @@ mod proxy {
         // connect to remote socket
         let mut remote_socket = Socket::builder().connect(target, port).map_err(|e| {
             Error::new(
-                ErrorKind::ConnectionAborted,
+                ErrorKind::ConnectionRefused,
                 format!("connect to remote failed: {}", e),
             )
         })?;
@@ -224,7 +271,7 @@ mod proxy {
         // check remote socket
         remote_socket.opened().await.map_err(|e| {
             Error::new(
-                ErrorKind::ConnectionReset,
+                ErrorKind::ConnectionRefused,
                 format!("remote socket not opened: {}", e),
             )
         })?;
@@ -240,15 +287,54 @@ mod proxy {
                 )
             })?;
 
-        // forward data
-        copy_bidirectional(client_socket, &mut remote_socket)
-            .await
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::ConnectionAborted,
-                    format!("forward data between client and remote failed: {}", e),
-                )
-            })?;
+        let (mut cr, mut cw) = tokio::io::split(client_socket);
+        let (mut rr, mut rw) = tokio::io::split(&mut remote_socket);
+
+        let c2r = async {
+            let mut buf = vec![0u8; COPY_BUF_SIZE];
+            loop {
+                let n = cr.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                rw.write_all(&buf[..n]).await?;
+            }
+            rw.shutdown().await?;
+            Ok::<_, Error>(())
+        };
+
+        let r2c = async {
+            let mut buf = vec![0u8; COPY_BUF_SIZE];
+            loop {
+                let n = rr.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                cw.write_all(&buf[..n]).await?;
+                cw.flush().await?;
+            }
+            cw.shutdown().await?;
+            Ok::<_, Error>(())
+        };
+
+        // When one direction ends (EOF or error), let the other drain
+        let result = match select(Box::pin(c2r), Box::pin(r2c)).await {
+            Either::Left((c2r_res, r2c_fut)) => {
+                let _ = r2c_fut.await;
+                c2r_res
+            }
+            Either::Right((r2c_res, c2r_fut)) => {
+                let _ = c2r_fut.await;
+                r2c_res
+            }
+        };
+
+        result.map_err(|e| {
+            Error::new(
+                ErrorKind::ConnectionAborted,
+                format!("forward data failed: {}", e),
+            )
+        })?;
 
         Ok(())
     }
@@ -359,22 +445,31 @@ mod ext {
 mod websocket {
     use futures_util::Stream;
     use std::{
+        future::Future,
         io::{Error, ErrorKind, Result},
         pin::Pin,
         task::{Context, Poll},
+        time::Duration,
     };
 
     use bytes::{BufMut, BytesMut};
     use pin_project::pin_project;
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-    use worker::{EventStream, WebSocket, WebsocketEvent};
+    use worker::{Delay, EventStream, WebSocket, WebsocketEvent};
+
+    const WRITE_BUFFER_HIGH_WATERMARK: u32 = 1024 * 1024;
+    const FLUSH_BUFFER_LOW_WATERMARK: u32 = 128 * 1024;
+    const BACKPRESSURE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
     #[pin_project]
     pub struct WebSocketStream<'a> {
         ws: &'a WebSocket,
         #[pin]
         stream: EventStream<'a>,
-        buffer: BytesMut,
+        #[pin]
+        write_delay: Option<Delay>,
+        read_buffer: BytesMut,
+        closed: bool,
     }
 
     impl<'a> WebSocketStream<'a> {
@@ -383,12 +478,47 @@ mod websocket {
             stream: EventStream<'a>,
             early_data: Option<Vec<u8>>,
         ) -> Self {
-            let mut buffer = BytesMut::new();
+            let mut read_buffer = BytesMut::new();
             if let Some(data) = early_data {
-                buffer.put_slice(&data)
+                read_buffer.put_slice(&data)
             }
 
-            Self { ws, stream, buffer }
+            Self {
+                ws,
+                stream,
+                write_delay: None,
+                read_buffer,
+                closed: false,
+            }
+        }
+
+        fn poll_backpressure(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            max_buffered_amount: u32,
+        ) -> Poll<Result<()>> {
+            let mut this = self.project();
+
+            loop {
+                if this.ws.as_ref().buffered_amount() <= max_buffered_amount {
+                    this.write_delay.set(None);
+                    return Poll::Ready(Ok(()));
+                }
+
+                match this.write_delay.as_mut().as_pin_mut() {
+                    Some(delay) => match delay.poll(cx) {
+                        Poll::Ready(()) => {
+                            this.write_delay
+                                .set(Some(Delay::from(BACKPRESSURE_POLL_INTERVAL)));
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    },
+                    None => {
+                        this.write_delay
+                            .set(Some(Delay::from(BACKPRESSURE_POLL_INTERVAL)));
+                    }
+                }
+            }
         }
     }
 
@@ -400,36 +530,81 @@ mod websocket {
         ) -> Poll<Result<()>> {
             let mut this = self.project();
 
-            loop {
-                let amt = std::cmp::min(this.buffer.len(), buf.remaining());
-                if amt > 0 {
-                    buf.put_slice(&this.buffer.split_to(amt));
-                    return Poll::Ready(Ok(()));
-                }
+            // If we already saw Close/None, return EOF immediately
+            if *this.closed {
+                return Poll::Ready(Ok(()));
+            }
 
+            // If buffer is empty, we must get at least one message (blocking)
+            if this.read_buffer.is_empty() {
                 match this.stream.as_mut().poll_next(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Some(Ok(WebsocketEvent::Message(msg)))) => {
                         if let Some(data) = msg.bytes() {
-                            this.buffer.put_slice(&data);
-                        };
-                        continue;
+                            this.read_buffer.put_slice(&data);
+                        }
+                    }
+                    Poll::Ready(Some(Ok(WebsocketEvent::Close(_)))) | Poll::Ready(None) => {
+                        *this.closed = true;
+                        return Poll::Ready(Ok(()));
                     }
                     Poll::Ready(Some(Err(e))) => {
-                        return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())))
+                        *this.closed = true;
+                        return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())));
                     }
-                    _ => return Poll::Ready(Ok(())), // None or Close event, return Ok to indicate stream end
                 }
             }
+
+            // Drain additional ready messages without blocking,
+            // but stop on Close/Error to avoid consuming them
+            while this.read_buffer.len() < buf.remaining() {
+                match this.stream.as_mut().poll_next(cx) {
+                    Poll::Ready(Some(Ok(WebsocketEvent::Message(msg)))) => {
+                        if let Some(data) = msg.bytes() {
+                            this.read_buffer.put_slice(&data);
+                        }
+                    }
+                    Poll::Ready(Some(Ok(WebsocketEvent::Close(_)))) | Poll::Ready(None) => {
+                        *this.closed = true;
+                        break;
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        // If we already have data buffered, deliver it first;
+                        // the error will surface on the next poll_read
+                        if !this.read_buffer.is_empty() {
+                            *this.closed = true;
+                            break;
+                        }
+                        *this.closed = true;
+                        return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())));
+                    }
+                    Poll::Pending => break,
+                }
+            }
+
+            let amt = std::cmp::min(this.read_buffer.len(), buf.remaining());
+            if amt > 0 {
+                buf.put_slice(&this.read_buffer.split_to(amt));
+            }
+            Poll::Ready(Ok(()))
         }
     }
 
     impl AsyncWrite for WebSocketStream<'_> {
         fn poll_write(
-            self: Pin<&mut Self>,
-            _: &mut Context<'_>,
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<Result<usize>> {
+            match self
+                .as_mut()
+                .poll_backpressure(cx, WRITE_BUFFER_HIGH_WATERMARK)
+            {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+
             if let Err(e) = self.ws.send_with_bytes(buf) {
                 return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())));
             }
@@ -437,12 +612,22 @@ mod websocket {
             Poll::Ready(Ok(buf.len()))
         }
 
-        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
-            Poll::Ready(Ok(()))
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+            self.as_mut()
+                .poll_backpressure(cx, FLUSH_BUFFER_LOW_WATERMARK)
         }
 
-        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
-            if let Err(e) = self.ws.close(None, Some("normal close")) {
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+            match self
+                .as_mut()
+                .poll_backpressure(cx, FLUSH_BUFFER_LOW_WATERMARK)
+            {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+
+            if let Err(e) = self.ws.close(Some(1000), Some("normal close")) {
                 return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())));
             }
 
