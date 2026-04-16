@@ -5,7 +5,7 @@ edition = "2021"
 
 # https://github.com/rustwasm/wasm-pack/issues/1247
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = false
+wasm-opt = ["-Oz"]
 
 [lib]
 crate-type = ["cdylib"]
@@ -15,10 +15,12 @@ worker = "0.8.0"
 tokio = { version = "1.28", features = ["io-util"] }
 pin-project = "1.1.0"
 futures-util = { version = "0.3.28", default-features = false }
-base64 = "0.13.0"
+base64 = "0.22"
 bytes = "1.4.0"
 
 [profile.release]
 lto = true
 strip = true
 codegen-units = 1
+opt-level = "z"
+panic = "abort"
