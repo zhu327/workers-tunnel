@@ -1,6 +1,5 @@
 use crate::proxy::{parse_early_data, parse_user_id, run_tunnel};
 use crate::websocket::WebSocketStream;
-use wasm_bindgen::JsValue;
 use worker::*;
 
 #[event(fetch)]
@@ -27,8 +26,8 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
 
         let fallback_site = env
             .var("FALLBACK_SITE")
-            .unwrap_or(JsValue::from_str("").into())
-            .to_string();
+            .map(|v| v.to_string())
+            .unwrap_or_default();
         if !fallback_site.is_empty() {
             return Fetch::Url(Url::parse(&fallback_site)?).send().await;
         }
@@ -42,7 +41,6 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
         .var("PROXY_IP")?
         .to_string()
         .split_ascii_whitespace()
-        .filter(|s| !s.is_empty())
         .map(String::from)
         .collect();
 
@@ -88,11 +86,10 @@ mod proxy {
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
 
-    use crate::ext::StreamExt;
+    use crate::ext::ReadStringExt;
     use crate::protocol;
     use crate::websocket::WebSocketStream;
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    use futures_util::future::{select, Either};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use worker::*;
 
@@ -151,14 +148,9 @@ mod proxy {
         user_id: [u8; 16],
         proxy_ip: &[String],
     ) -> Result<()> {
-        let request = match select(
-            Box::pin(read_tunnel_request(&mut client_socket, &user_id)),
-            Box::pin(Delay::from(HANDSHAKE_TIMEOUT)),
-        )
-        .await
-        {
-            Either::Left((result, _)) => result?,
-            Either::Right((_, _)) => {
+        let request = tokio::select! {
+            result = read_tunnel_request(&mut client_socket, &user_id) => result?,
+            _ = Delay::from(HANDSHAKE_TIMEOUT) => {
                 return Err(Error::new(
                     ErrorKind::TimedOut,
                     "tunnel handshake timed out",
@@ -191,12 +183,7 @@ mod proxy {
                 }))
             }
             protocol::NETWORK_TYPE_UDP => {
-                process_udp_outbound(
-                    &mut client_socket,
-                    &request.remote_addr,
-                    request.remote_port,
-                )
-                .await
+                process_udp_outbound(&mut client_socket, request.remote_port).await
             }
             unknown => Err(Error::new(
                 ErrorKind::InvalidData,
@@ -221,8 +208,10 @@ mod proxy {
 
         let addon_len = client_socket.read_u8().await? as usize;
         if addon_len > 0 {
-            let mut skip = [0u8; 255];
-            client_socket.read_exact(&mut skip[..addon_len]).await?;
+            let mut addon_buf = [0u8; 255];
+            client_socket
+                .read_exact(&mut addon_buf[..addon_len])
+                .await?;
         }
 
         // read network type
@@ -268,24 +257,12 @@ mod proxy {
             )
         })?;
 
-        match select(
-            Box::pin(remote_socket.opened()),
-            Box::pin(Delay::from(CONNECT_TIMEOUT)),
-        )
-        .await
-        {
-            Either::Left((Ok(_), _)) => {}
-            Either::Left((Err(e), _)) => {
-                return Err(Error::new(
-                    ErrorKind::ConnectionRefused,
-                    format!("remote socket not opened: {}", e),
-                ));
-            }
-            Either::Right(_) => {
-                return Err(Error::new(
-                    ErrorKind::TimedOut,
-                    "connect to remote timed out",
-                ));
+        tokio::select! {
+            result = remote_socket.opened() => { result.map_err(|e| {
+                Error::new(ErrorKind::ConnectionRefused, format!("remote socket not opened: {}", e))
+            })?; }
+            _ = Delay::from(CONNECT_TIMEOUT) => {
+                return Err(Error::new(ErrorKind::TimedOut, "connect to remote timed out"));
             }
         }
 
@@ -315,6 +292,7 @@ mod proxy {
             rw.shutdown().await?;
             Ok::<_, Error>(())
         };
+        tokio::pin!(c2r);
 
         let r2c = async {
             let mut buf = vec![0u8; COPY_BUF_SIZE];
@@ -329,23 +307,24 @@ mod proxy {
             cw.shutdown().await?;
             Ok::<_, Error>(())
         };
+        tokio::pin!(r2c);
 
-        let relay = async {
-            match select(Box::pin(c2r), Box::pin(r2c)).await {
-                Either::Left((c2r_res, r2c_fut)) => {
-                    let _ = select(r2c_fut, Box::pin(Delay::from(DRAIN_TIMEOUT))).await;
-                    c2r_res
-                }
-                Either::Right((r2c_res, c2r_fut)) => {
-                    let _ = select(c2r_fut, Box::pin(Delay::from(DRAIN_TIMEOUT))).await;
-                    r2c_res
-                }
+        let result = tokio::select! {
+            result = &mut c2r => {
+                let _ = tokio::select! {
+                    _ = &mut r2c => {}
+                    _ = Delay::from(DRAIN_TIMEOUT) => {}
+                };
+                result
             }
-        };
-
-        let result = match select(Box::pin(relay), Box::pin(Delay::from(RELAY_TIMEOUT))).await {
-            Either::Left((result, _)) => result,
-            Either::Right(_) => {
+            result = &mut r2c => {
+                let _ = tokio::select! {
+                    _ = &mut c2r => {}
+                    _ = Delay::from(DRAIN_TIMEOUT) => {}
+                };
+                result
+            }
+            _ = Delay::from(RELAY_TIMEOUT) => {
                 console_log!("relay timed out: {}:{}", target, port);
                 return Ok(());
             }
@@ -360,7 +339,6 @@ mod proxy {
 
     async fn process_udp_outbound(
         client_socket: &mut WebSocketStream<'_>,
-        _: &str,
         port: u16,
     ) -> Result<()> {
         if port != 53 {
@@ -423,9 +401,9 @@ mod proxy {
                 })
             };
 
-            let data = match select(Box::pin(dns_fetch), Box::pin(Delay::from(DNS_TIMEOUT))).await {
-                Either::Left((result, _)) => result?,
-                Either::Right(_) => {
+            let data = tokio::select! {
+                result = dns_fetch => result?,
+                _ = Delay::from(DNS_TIMEOUT) => {
                     return Err(Error::new(ErrorKind::TimedOut, "DNS query timed out"));
                 }
             };
@@ -440,11 +418,11 @@ mod proxy {
 mod ext {
     use std::io::Result;
     use tokio::io::AsyncReadExt;
-    pub trait StreamExt {
+    pub trait ReadStringExt {
         async fn read_string(&mut self, n: usize) -> Result<String>;
     }
 
-    impl<T: AsyncReadExt + Unpin + ?Sized> StreamExt for T {
+    impl<T: AsyncReadExt + Unpin + ?Sized> ReadStringExt for T {
         async fn read_string(&mut self, n: usize) -> Result<String> {
             let mut buffer = vec![0u8; n];
             self.read_exact(&mut buffer).await?;
@@ -459,7 +437,7 @@ mod ext {
 }
 
 mod websocket {
-    use futures_util::Stream;
+    use futures_core::Stream;
     use std::{
         future::Future,
         io::{Error, ErrorKind, Result},

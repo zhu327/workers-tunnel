@@ -12,9 +12,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 worker = "0.8.0"
-tokio = { version = "1.28", features = ["io-util"] }
+tokio = { version = "1.28", features = ["io-util", "macros"] }
 pin-project = "1.1.0"
-futures-util = { version = "0.3.28", default-features = false }
+futures-core = { version = "0.3.28", default-features = false }
 base64 = "0.22"
 bytes = "1.4.0"
 
