@@ -117,6 +117,13 @@ wrangler secret put USER_ID
 Until it is set, the worker refuses tunnel traffic. The same applies to the
 one-click deploy button: deploy first, then set the secret.
 
+`wrangler secret` does not apply to `wrangler dev`. For local runs, put the
+value in `.dev.vars` (already git-ignored) instead:
+
+```
+USER_ID = "your-uuid-here"
+```
+
 The remaining settings stay in `[vars]` and are all optional:
 
 | Variable | Default | Purpose |
