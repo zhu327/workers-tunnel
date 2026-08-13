@@ -10,7 +10,21 @@ enabled = true
 head_sampling_rate = 1
 
 [vars]
-USER_ID = "c55ba35f-12f6-436e-a451-4ce982c4ec1c" # your uuid
-PROXY_IP = "" # proxyip.fxxk.dedyn.io
-FALLBACK_SITE = "" # https://httpbin.org/status/404
-SHOW_URI = "true" # show vless uri in /UUID path
+# Set with `wrangler secret put USER_ID`, not here. Anything under [vars] is
+# committed to the repository and is readable from the dashboard, and a
+# credential published next to the code makes the worker an open proxy for
+# anyone who reads it. Tunnel traffic is refused while this is unset.
+USER_ID = ""
+
+# Fallback relays, whitespace separated, tried in order when the destination
+# refuses the connection. An entry may pin its own port ("proxy.example:8443");
+# one without a port uses the port the client asked for.
+PROXY_IP = ""
+
+# A site to mirror for everything that is not a tunnel upgrade. Recommended:
+# without it those requests answer 404, which is a thin cover story.
+FALLBACK_SITE = ""
+
+# Serve the vless:// URI at /<USER_ID>. Off by default: it hands the full
+# credential to anyone who can reach that path.
+SHOW_URI = "false"
