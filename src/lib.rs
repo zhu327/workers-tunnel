@@ -38,7 +38,7 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
             Ok(events) => events,
             Err(err) => {
                 console_error!("could not open websocket stream: {}", err);
-                _ = server.close(Some(1011), None::<&str>);
+                _ = server.close(Some(1000), None::<&str>);
                 return;
             }
         };
@@ -76,9 +76,17 @@ async fn serve_http(req: &Request, env: &Env, user_id: &str) -> Result<Response>
         ));
     }
 
-    match setting(env, "FALLBACK_SITE") {
-        Some(site) => Fetch::Url(Url::parse(&site)?).send().await,
-        None => Response::error("Not Found", 404),
+    let Some(site) = setting(env, "FALLBACK_SITE") else {
+        return Response::error("Not Found", 404);
+    };
+
+    match Url::parse(&site) {
+        Ok(url) => Fetch::Url(url).send().await,
+        // `?` would surface the parse error in the response body.
+        Err(err) => {
+            console_error!("FALLBACK_SITE is not a valid URL: {err}");
+            Response::error("Not Found", 404)
+        }
     }
 }
 
@@ -170,7 +178,9 @@ mod proxy {
         for (a, b) in received.iter().zip(expected.iter()) {
             diff |= a ^ b;
         }
-        diff == 0
+        // `diff` only ever gains bits, so LLVM is free to restore the early
+        // exit; `black_box` denies it that.
+        std::hint::black_box(diff) == 0
     }
 
     /// Splits an optional port off a `PROXY_IP` entry; else the requested port.
@@ -234,7 +244,7 @@ mod proxy {
             }
             unknown => Err(Error::new(
                 ErrorKind::InvalidData,
-                format!("unsupported network type: {}", unknown),
+                format!("unsupported network type: {unknown}"),
             )),
         }
     }
@@ -300,13 +310,13 @@ mod proxy {
         let mut remote_socket = Socket::builder().connect(target, port).map_err(|e| {
             Error::new(
                 ErrorKind::ConnectionRefused,
-                format!("connect to remote failed: {}", e),
+                format!("connect to remote failed: {e}"),
             )
         })?;
 
         tokio::select! {
             result = remote_socket.opened() => { result.map_err(|e| {
-                Error::new(ErrorKind::ConnectionRefused, format!("remote socket not opened: {}", e))
+                Error::new(ErrorKind::ConnectionRefused, format!("remote socket not opened: {e}"))
             })?; }
             _ = Delay::from(CONNECT_TIMEOUT) => {
                 return Err(Error::new(ErrorKind::TimedOut, "connect to remote timed out"));
@@ -319,11 +329,12 @@ mod proxy {
             .map_err(|e| {
                 Error::new(
                     ErrorKind::ConnectionAborted,
-                    format!("send response header failed: {}", e),
+                    format!("send response header failed: {e}"),
                 )
             })?;
         client_socket.flush().await?;
 
+        let ws = client_socket.socket();
         let (mut cr, mut cw) = tokio::io::split(client_socket);
         let (mut rr, mut rw) = tokio::io::split(&mut remote_socket);
 
@@ -393,13 +404,17 @@ mod proxy {
                     target,
                     port
                 );
-                return Ok(());
+                Ok(())
             }
         };
 
         if let Err(e) = result {
             console_log!("forward data ended: {}:{} - {}", target, port, e);
         }
+
+        // `poll_shutdown` only runs when the client half completes, so the idle
+        // and drain-timeout exits would otherwise leave the peer with a 1006.
+        _ = ws.close(Some(1000), None::<&str>);
 
         Ok(())
     }
@@ -421,7 +436,7 @@ mod proxy {
             .map_err(|e| {
                 Error::new(
                     ErrorKind::ConnectionAborted,
-                    format!("send response header failed: {}", e),
+                    format!("send response header failed: {e}"),
                 )
             })?;
         client_socket.flush().await?;
@@ -446,19 +461,19 @@ mod proxy {
             _ = init.headers.set("Content-Type", "application/dns-message");
 
             let request = Request::new_with_init("https://1.1.1.1/dns-query", &init)
-                .map_err(|e| Error::other(format!("create DNS request failed: {}", e)))?;
+                .map_err(|e| Error::other(format!("create DNS request failed: {e}")))?;
 
             let dns_fetch = async {
                 let mut response = Fetch::Request(request).send().await.map_err(|e| {
                     Error::new(
                         ErrorKind::ConnectionAborted,
-                        format!("send DNS-over-HTTP request failed: {}", e),
+                        format!("send DNS-over-HTTP request failed: {e}"),
                     )
                 })?;
                 response.bytes().await.map_err(|e| {
                     Error::new(
                         ErrorKind::ConnectionAborted,
-                        format!("DNS-over-HTTP response body error: {}", e),
+                        format!("DNS-over-HTTP response body error: {e}"),
                     )
                 })
             };
@@ -620,7 +635,7 @@ mod ext {
             String::from_utf8(buffer).map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("invalid string: {}", e),
+                    format!("invalid string: {e}"),
                 )
             })
         }
@@ -675,6 +690,11 @@ mod websocket {
                 read_buffer,
                 closed: false,
             }
+        }
+
+        /// The underlying socket, for exits that never reach `poll_shutdown`.
+        pub fn socket(&self) -> &'a WebSocket {
+            self.ws
         }
 
         fn poll_backpressure(
@@ -752,7 +772,8 @@ mod websocket {
                         break;
                     }
                     Poll::Ready(Some(Err(_))) => {
-                        // Deliver what is buffered; the stream ends next call.
+                        // Deliberately unlike the loop above: bytes are already
+                        // buffered, so deliver them and end the stream next call.
                         *this.closed = true;
                         break;
                     }
