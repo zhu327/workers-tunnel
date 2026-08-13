@@ -16,9 +16,6 @@ jobs:
             - name: Install modules
               run: npm install
             - uses: actions-rust-lang/setup-rust-toolchain@v1
-              with:
-                  toolchain: stable
-                  target: wasm32-unknown-unknown
             - name: Deploy
               uses: cloudflare/wrangler-action@v3
               with:
