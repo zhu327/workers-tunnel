@@ -58,14 +58,13 @@ Replace the domain `your.domain.workers.dev` in the following configuration with
         "network": "ws",
         "tlsSettings": {
           "serverName": "your.domain.workers.dev",
-          "allowInsecure": true,
           "fingerprint": "chrome"
         },
         "wsSettings": {
           "headers": {
             "Host": "your.domain.workers.dev"
           },
-          "path": "ws?ed=512"
+          "path": "/ws?ed=512"
         },
         "security": "tls"
       }
@@ -104,12 +103,27 @@ Please refer to the following documentation for development and deployment.
 
 <https://developers.cloudflare.com/workers/runtime-apis/webassembly/rust/>
 
-**Important**: Before deployment, you need to modify the `vars` configuration in `wrangler.toml` and change `USER_ID` to your UUID.
+## Configuration
 
-```toml
-[vars]
-USER_ID = "c55ba35f-12f6-436e-a451-4ce982c4ec1c"
+`USER_ID` is the only credential the tunnel has, so set it as a secret rather
+than as a var. Values under `[vars]` are committed to the repository and are
+readable from the Cloudflare dashboard; a UUID published next to the code makes
+the worker an open proxy for anyone who reads it.
+
+```sh
+wrangler secret put USER_ID
 ```
+
+Until it is set, the worker refuses tunnel traffic. The same applies to the
+one-click deploy button: deploy first, then set the secret.
+
+The remaining settings stay in `[vars]` and are all optional:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `FALLBACK_SITE` | unset | Site to mirror for requests that are not tunnel upgrades. Without it they answer `404`. Worth setting: a worker that responds distinctively to ordinary HTTP is easy to pick out of a scan of `workers.dev`. |
+| `PROXY_IP` | unset | Whitespace-separated relays tried in order when the destination refuses the connection. An entry may pin its own port (`proxy.example:8443`); one without a port uses the port the client asked for. |
+| `SHOW_URI` | `false` | Serves the `vless://` URI at `/<USER_ID>`. It hands the full credential to anyone who can reach that path, so leave it off unless you are actively provisioning a client. |
 
 ## Setup
 
