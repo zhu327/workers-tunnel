@@ -19,7 +19,6 @@ jobs:
               with:
                   toolchain: stable
                   target: wasm32-unknown-unknown
-            - run: cargo install cargo-generate
             - name: Deploy
               uses: cloudflare/wrangler-action@v3
               with:
