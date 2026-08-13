@@ -4,42 +4,25 @@ use worker::*;
 
 #[event(fetch)]
 async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
-    let uuid_str = env.var("USER_ID")?.to_string();
+    let user_id_str = setting(&env, "USER_ID").unwrap_or_default();
 
     let is_websocket = req
         .headers()
         .get("Upgrade")?
-        .map(|up| up == "websocket")
-        .unwrap_or(false);
+        .is_some_and(|up| up.eq_ignore_ascii_case("websocket"));
 
     if !is_websocket {
-        let show_uri: bool = env.var("SHOW_URI")?.to_string().parse().unwrap_or(false);
-        if show_uri && req.path().contains(uuid_str.as_str()) {
-            let host_str = req.url()?.host_str().unwrap_or_default().to_string();
-            let vless_uri = format!(
-                "vless://{uuid}@{host}:443?encryption=none&security=tls&sni={host}&fp=chrome&type=ws&host={host}&path=ws#workers-tunnel",
-                uuid = uuid_str,
-                host = host_str
-            );
-            return Response::ok(vless_uri);
-        }
-
-        let fallback_site = env
-            .var("FALLBACK_SITE")
-            .map(|v| v.to_string())
-            .unwrap_or_default();
-        if !fallback_site.is_empty() {
-            return Fetch::Url(Url::parse(&fallback_site)?).send().await;
-        }
-
-        return Response::ok("ok");
+        return serve_http(&req, &env, &user_id_str).await;
     }
 
-    let user_id = parse_user_id(&uuid_str);
+    // Fail closed on a malformed USER_ID.
+    let Some(user_id) = parse_user_id(&user_id_str) else {
+        console_error!("USER_ID is missing or is not a valid UUID; refusing tunnel traffic");
+        return Response::error("Bad Request", 400);
+    };
 
-    let proxy_ip: Vec<String> = env
-        .var("PROXY_IP")?
-        .to_string()
+    let proxy_ip: Vec<String> = setting(&env, "PROXY_IP")
+        .unwrap_or_default()
         .split_ascii_whitespace()
         .map(String::from)
         .collect();
@@ -54,8 +37,8 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
         let events = match server.events() {
             Ok(events) => events,
             Err(err) => {
-                console_error!("error: could not open websocket stream: {}", err);
-                _ = server.close(Some(1011), Some("websocket stream error"));
+                console_error!("could not open websocket stream: {}", err);
+                _ = server.close(Some(1011), None::<&str>);
                 return;
             }
         };
@@ -63,12 +46,40 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
         let socket = WebSocketStream::new(&server, events, early_data);
 
         if let Err(err) = run_tunnel(socket, user_id, &proxy_ip).await {
-            console_error!("error: {}", err);
-            _ = server.close(Some(1003), Some("invalid request"));
+            // Generic close: do not advertise this as a tunnel.
+            console_error!("tunnel closed: {}", err);
+            _ = server.close(Some(1000), None::<&str>);
         }
     });
 
     Response::from_websocket(client)
+}
+
+/// Reads a var or secret, blank meaning unset. `Env::var` resolves both.
+fn setting(env: &Env, name: &str) -> Option<String> {
+    env.var(name)
+        .ok()
+        .map(|value| value.to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Serves anything that is not a tunnel upgrade.
+async fn serve_http(req: &Request, env: &Env, user_id: &str) -> Result<Response> {
+    let show_uri = setting(env, "SHOW_URI").is_some_and(|value| value.eq_ignore_ascii_case("true"));
+
+    // Exact match, not a substring.
+    if show_uri && !user_id.is_empty() && req.path() == format!("/{user_id}") {
+        let host = req.url()?.host_str().unwrap_or_default().to_string();
+        // Encoded `/ws?ed=512`; `ed` is what enables early data.
+        return Response::ok(format!(
+            "vless://{user_id}@{host}:443?encryption=none&security=tls&sni={host}&fp=chrome&type=ws&host={host}&path=%2Fws%3Fed%3D512#workers-tunnel"
+        ));
+    }
+
+    match setting(env, "FALLBACK_SITE") {
+        Some(site) => Fetch::Url(Url::parse(&site)?).send().await,
+        None => Response::error("Not Found", 404),
+    }
 }
 
 mod protocol {
@@ -82,6 +93,7 @@ mod protocol {
 }
 
 mod proxy {
+    use std::cell::Cell;
     use std::io::{Error, ErrorKind, Result};
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
@@ -97,9 +109,11 @@ mod proxy {
 
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-    const RELAY_TIMEOUT: Duration = Duration::from_secs(900);
     const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
     const DNS_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Torn down once *both* directions have been silent this long.
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(900);
 
     struct TunnelRequest {
         network_type: u8,
@@ -118,29 +132,60 @@ mod proxy {
                 }));
                 match URL_SAFE_NO_PAD.decode(&raw) {
                     Ok(early_data) => return Ok(Some(early_data)),
-                    Err(err) => return Err(Error::new(ErrorKind::Other, err.to_string())),
+                    Err(err) => return Err(Error::other(err.to_string())),
                 }
             }
         }
         Ok(None)
     }
 
-    pub fn parse_user_id(user_id: &str) -> [u8; 16] {
-        let mut iter = user_id.as_bytes().iter().filter_map(|b| match b {
-            b'0'..=b'9' => Some(b - b'0'),
-            b'a'..=b'f' => Some(b - b'a' + 10),
-            b'A'..=b'F' => Some(b - b'A' + 10),
-            _ => None,
-        });
+    /// Decodes a UUID into the 16-byte credential. Hyphens optional, case
+    /// ignored, anything else rejected.
+    pub fn parse_user_id(user_id: &str) -> Option<[u8; 16]> {
+        fn nibble(byte: u8) -> Option<u8> {
+            match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            }
+        }
+
+        let mut hex = user_id.bytes().filter(|&byte| byte != b'-');
 
         let mut bytes = [0u8; 16];
-        for b in &mut bytes {
-            let (Some(h), Some(l)) = (iter.next(), iter.next()) else {
-                break;
-            };
-            *b = (h << 4) | l;
+        for byte in &mut bytes {
+            let high = nibble(hex.next()?)?;
+            let low = nibble(hex.next()?)?;
+            *byte = (high << 4) | low;
         }
-        bytes
+
+        // Reject trailing input.
+        hex.next().is_none().then_some(bytes)
+    }
+
+    /// No early exit on the first differing byte. Not hardened constant-time.
+    fn user_id_matches(received: &[u8; 16], expected: &[u8; 16]) -> bool {
+        let mut diff = 0u8;
+        for (a, b) in received.iter().zip(expected.iter()) {
+            diff |= a ^ b;
+        }
+        diff == 0
+    }
+
+    /// Splits an optional port off a `PROXY_IP` entry; else the requested port.
+    fn split_proxy_target(entry: &str, default_port: u16) -> (&str, u16) {
+        let Some((host, port)) = entry.rsplit_once(':') else {
+            return (entry, default_port);
+        };
+
+        // A bare IPv6 literal also splits on ':'.
+        let host_is_complete = !host.is_empty() && (host.ends_with(']') || !host.contains(':'));
+
+        match port.parse() {
+            Ok(port) if host_is_complete => (host, port),
+            _ => (entry, default_port),
+        }
     }
 
     pub async fn run_tunnel(
@@ -163,12 +208,14 @@ mod proxy {
             protocol::NETWORK_TYPE_TCP => {
                 let mut last_error = None;
 
-                for target in std::iter::once(request.remote_addr.as_str())
-                    .chain(proxy_ip.iter().map(|s| s.as_str()))
+                for (target, port) in
+                    std::iter::once((request.remote_addr.as_str(), request.remote_port)).chain(
+                        proxy_ip
+                            .iter()
+                            .map(|entry| split_proxy_target(entry, request.remote_port)),
+                    )
                 {
-                    match process_tcp_outbound(&mut client_socket, target, request.remote_port)
-                        .await
-                    {
+                    match process_tcp_outbound(&mut client_socket, target, port).await {
                         Ok(_) => return Ok(()),
                         Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
                             last_error = Some(e);
@@ -202,7 +249,7 @@ mod proxy {
 
         let mut id_buf = [0u8; 16];
         client_socket.read_exact(&mut id_buf).await?;
-        if id_buf != *user_id {
+        if !user_id_matches(&id_buf, user_id) {
             return Err(Error::new(ErrorKind::InvalidData, "invalid user id"));
         }
 
@@ -280,6 +327,9 @@ mod proxy {
         let (mut cr, mut cw) = tokio::io::split(client_socket);
         let (mut rr, mut rw) = tokio::io::split(&mut remote_socket);
 
+        // Traffic either way keeps the relay alive.
+        let active = Cell::new(false);
+
         let c2r = async {
             let mut buf = vec![0u8; COPY_BUF_SIZE];
             loop {
@@ -287,6 +337,7 @@ mod proxy {
                 if n == 0 {
                     break;
                 }
+                active.set(true);
                 rw.write_all(&buf[..n]).await?;
             }
             rw.shutdown().await?;
@@ -301,6 +352,7 @@ mod proxy {
                 if n == 0 {
                     break;
                 }
+                active.set(true);
                 cw.write_all(&buf[..n]).await?;
             }
             cw.flush().await?;
@@ -309,23 +361,38 @@ mod proxy {
         };
         tokio::pin!(r2c);
 
+        // Sampled, so a quiet relay survives up to two intervals.
+        let idle = async {
+            loop {
+                Delay::from(IDLE_TIMEOUT).await;
+                if !active.replace(false) {
+                    return;
+                }
+            }
+        };
+
         let result = tokio::select! {
             result = &mut c2r => {
-                let _ = tokio::select! {
+                tokio::select! {
                     _ = &mut r2c => {}
                     _ = Delay::from(DRAIN_TIMEOUT) => {}
                 };
                 result
             }
             result = &mut r2c => {
-                let _ = tokio::select! {
+                tokio::select! {
                     _ = &mut c2r => {}
                     _ = Delay::from(DRAIN_TIMEOUT) => {}
                 };
                 result
             }
-            _ = Delay::from(RELAY_TIMEOUT) => {
-                console_log!("relay timed out: {}:{}", target, port);
+            _ = idle => {
+                console_log!(
+                    "relay idle for {}s: {}:{}",
+                    IDLE_TIMEOUT.as_secs(),
+                    target,
+                    port
+                );
                 return Ok(());
             }
         };
@@ -378,13 +445,8 @@ mod proxy {
             init.body = Some(buf[..len].to_vec().into());
             _ = init.headers.set("Content-Type", "application/dns-message");
 
-            let request =
-                Request::new_with_init("https://1.1.1.1/dns-query", &init).map_err(|e| {
-                    Error::new(
-                        ErrorKind::Other,
-                        format!("create DNS request failed: {}", e),
-                    )
-                })?;
+            let request = Request::new_with_init("https://1.1.1.1/dns-query", &init)
+                .map_err(|e| Error::other(format!("create DNS request failed: {}", e)))?;
 
             let dns_fetch = async {
                 let mut response = Fetch::Request(request).send().await.map_err(|e| {
@@ -408,9 +470,138 @@ mod proxy {
                 }
             };
 
-            client_socket.write_u16(data.len() as u16).await?;
+            // Truncating to the 16-bit prefix would desynchronise the stream.
+            let Ok(response_len) = u16::try_from(data.len()) else {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "DNS response exceeds the 16-bit length prefix",
+                ));
+            };
+
+            client_socket.write_u16(response_len).await?;
             client_socket.write_all(&data).await?;
             client_socket.flush().await?;
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{parse_early_data, parse_user_id, split_proxy_target, user_id_matches};
+
+        const RAW: [u8; 16] = [
+            0xc5, 0x5b, 0xa3, 0x5f, 0x12, 0xf6, 0x43, 0x6e, 0xa4, 0x51, 0x4c, 0xe9, 0x82, 0xc4,
+            0xec, 0x1c,
+        ];
+
+        #[test]
+        fn parses_a_canonical_uuid() {
+            assert_eq!(
+                parse_user_id("c55ba35f-12f6-436e-a451-4ce982c4ec1c"),
+                Some(RAW)
+            );
+        }
+
+        #[test]
+        fn accepts_uppercase_and_unhyphenated_forms() {
+            assert_eq!(
+                parse_user_id("C55BA35F-12F6-436E-A451-4CE982C4EC1C"),
+                Some(RAW)
+            );
+            assert_eq!(parse_user_id("c55ba35f12f6436ea4514ce982c4ec1c"), Some(RAW));
+        }
+
+        #[test]
+        fn rejects_anything_that_is_not_a_uuid() {
+            // All of these once produced a usable key.
+            for id in [
+                "",
+                "c55ba35f",
+                "not-a-uuid",
+                "c55ba35f-12f6-436e-a451-4ce982c4ec1",
+                "c55ba35f-12f6-436e-a451-4ce982c4ec1c0",
+                "c55ba35f-12f6-436e-a451-4ce982c4ec1z",
+            ] {
+                assert_eq!(parse_user_id(id), None, "{id:?} should be rejected");
+            }
+        }
+
+        #[test]
+        fn credential_comparison_agrees_with_equality() {
+            assert!(user_id_matches(&RAW, &RAW));
+
+            // Both ends, not just the first byte.
+            for index in [0, 15] {
+                let mut received = RAW;
+                received[index] ^= 0x80;
+                assert!(!user_id_matches(&received, &RAW), "byte {index}");
+            }
+        }
+
+        #[test]
+        fn proxy_entry_without_a_port_inherits_the_requested_one() {
+            assert_eq!(
+                split_proxy_target("proxy.example", 443),
+                ("proxy.example", 443)
+            );
+            assert_eq!(split_proxy_target("192.0.2.1", 8080), ("192.0.2.1", 8080));
+        }
+
+        #[test]
+        fn proxy_entry_may_pin_its_own_port() {
+            assert_eq!(
+                split_proxy_target("proxy.example:8443", 443),
+                ("proxy.example", 8443)
+            );
+            assert_eq!(
+                split_proxy_target("[2001:db8::1]:8443", 443),
+                ("[2001:db8::1]", 8443)
+            );
+        }
+
+        #[test]
+        fn bare_ipv6_is_not_read_as_a_host_port_pair() {
+            // Splitting on the last colon would yield ("2001:db8:", 1).
+            assert_eq!(split_proxy_target("2001:db8::1", 443), ("2001:db8::1", 443));
+        }
+
+        #[test]
+        fn unusable_port_suffixes_fall_back_to_the_requested_port() {
+            for entry in [
+                "proxy.example:",
+                "proxy.example:https",
+                "proxy.example:99999",
+                ":443",
+            ] {
+                assert_eq!(split_proxy_target(entry, 8080), (entry, 8080));
+            }
+        }
+
+        #[test]
+        fn early_data_is_absent_unless_the_header_carries_it() {
+            assert_eq!(parse_early_data(None).unwrap(), None);
+            assert_eq!(parse_early_data(Some(String::new())).unwrap(), None);
+        }
+
+        #[test]
+        fn early_data_accepts_both_base64_alphabets() {
+            let standard = parse_early_data(Some("/+/+".to_owned())).unwrap();
+            let url_safe = parse_early_data(Some("_-_-".to_owned())).unwrap();
+
+            assert_eq!(standard, Some(vec![0xff, 0xef, 0xfe]));
+            assert_eq!(standard, url_safe);
+        }
+
+        #[test]
+        fn early_data_ignores_padding() {
+            assert_eq!(
+                parse_early_data(Some("QQ==".to_owned())).unwrap(),
+                Some(vec![b'A'])
+            );
+        }
+
+        #[test]
+        fn early_data_rejects_undecodable_input() {
+            assert!(parse_early_data(Some("!!!!".to_owned())).is_err());
         }
     }
 }
@@ -440,7 +631,7 @@ mod websocket {
     use futures_core::Stream;
     use std::{
         future::Future,
-        io::{Error, ErrorKind, Result},
+        io::{Error, Result},
         pin::Pin,
         task::{Context, Poll},
         time::Duration,
@@ -524,13 +715,12 @@ mod websocket {
         ) -> Poll<Result<()>> {
             let mut this = self.project();
 
-            // If we already saw Close/None, return EOF immediately
             if *this.closed {
                 return Poll::Ready(Ok(()));
             }
 
-            // If buffer is empty, we must get at least one message (blocking)
-            if this.read_buffer.is_empty() {
+            // A `Ready` filling nothing is EOF; `bytes()` is `None` on text.
+            while this.read_buffer.is_empty() {
                 match this.stream.as_mut().poll_next(cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Some(Ok(WebsocketEvent::Message(msg)))) => {
@@ -544,13 +734,12 @@ mod websocket {
                     }
                     Poll::Ready(Some(Err(e))) => {
                         *this.closed = true;
-                        return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())));
+                        return Poll::Ready(Err(Error::other(e.to_string())));
                     }
                 }
             }
 
-            // Drain additional ready messages without blocking,
-            // but stop on Close/Error to avoid consuming them
+            // Coalesce what is already queued, stopping at anything terminal.
             while this.read_buffer.len() < buf.remaining() {
                 match this.stream.as_mut().poll_next(cx) {
                     Poll::Ready(Some(Ok(WebsocketEvent::Message(msg)))) => {
@@ -562,24 +751,17 @@ mod websocket {
                         *this.closed = true;
                         break;
                     }
-                    Poll::Ready(Some(Err(e))) => {
-                        // If we already have data buffered, deliver it first;
-                        // the error will surface on the next poll_read
-                        if !this.read_buffer.is_empty() {
-                            *this.closed = true;
-                            break;
-                        }
+                    Poll::Ready(Some(Err(_))) => {
+                        // Deliver what is buffered; the stream ends next call.
                         *this.closed = true;
-                        return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())));
+                        break;
                     }
                     Poll::Pending => break,
                 }
             }
 
             let amt = std::cmp::min(this.read_buffer.len(), buf.remaining());
-            if amt > 0 {
-                buf.put_slice(&this.read_buffer.split_to(amt));
-            }
+            buf.put_slice(&this.read_buffer.split_to(amt));
             Poll::Ready(Ok(()))
         }
     }
@@ -600,7 +782,7 @@ mod websocket {
             }
 
             if let Err(e) = self.ws.send_with_bytes(buf) {
-                return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())));
+                return Poll::Ready(Err(Error::other(e.to_string())));
             }
 
             Poll::Ready(Ok(buf.len()))
@@ -621,8 +803,9 @@ mod websocket {
                 Poll::Pending => return Poll::Pending,
             }
 
-            if let Err(e) = self.ws.close(Some(1000), Some("normal close")) {
-                return Poll::Ready(Err(Error::new(ErrorKind::Other, e.to_string())));
+            // No reason string: every close should look alike.
+            if let Err(e) = self.ws.close(Some(1000), None::<&str>) {
+                return Poll::Ready(Err(Error::other(e.to_string())));
             }
 
             Poll::Ready(Ok(()))
