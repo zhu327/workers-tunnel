@@ -21,12 +21,6 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
         return Response::error("Bad Request", 400);
     };
 
-    let proxy_ip: Vec<String> = setting(&env, "PROXY_IP")
-        .unwrap_or_default()
-        .split_ascii_whitespace()
-        .map(String::from)
-        .collect();
-
     let early_data = req.headers().get("sec-websocket-protocol")?;
     let early_data = parse_early_data(early_data)?;
 
@@ -45,7 +39,7 @@ async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
 
         let socket = WebSocketStream::new(&server, events, early_data);
 
-        if let Err(err) = run_tunnel(socket, user_id, &proxy_ip).await {
+        if let Err(err) = run_tunnel(socket, user_id, &env).await {
             // Generic close: do not advertise this as a tunnel.
             console_error!("tunnel closed: {}", err);
             _ = server.close(Some(1000), None::<&str>);
@@ -108,6 +102,7 @@ mod proxy {
 
     use crate::ext::ReadStringExt;
     use crate::protocol;
+    use crate::setting;
     use crate::websocket::WebSocketStream;
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -201,7 +196,7 @@ mod proxy {
     pub async fn run_tunnel(
         mut client_socket: WebSocketStream<'_>,
         user_id: [u8; 16],
-        proxy_ip: &[String],
+        env: &Env,
     ) -> Result<()> {
         let request = tokio::select! {
             result = read_tunnel_request(&mut client_socket, &user_id) => result?,
@@ -216,12 +211,15 @@ mod proxy {
         // process outbound
         match request.network_type {
             protocol::NETWORK_TYPE_TCP => {
+                // Read the relay list only for TCP: UDP/DoH tunnels used to pay
+                // for the `Env::var` lookup and the allocation on every connect.
+                let proxy_ip = setting(env, "PROXY_IP").unwrap_or_default();
                 let mut last_error = None;
 
                 for (target, port) in
                     std::iter::once((request.remote_addr.as_str(), request.remote_port)).chain(
                         proxy_ip
-                            .iter()
+                            .split_ascii_whitespace()
                             .map(|entry| split_proxy_target(entry, request.remote_port)),
                     )
                 {
