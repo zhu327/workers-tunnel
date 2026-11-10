@@ -4,19 +4,17 @@ use worker::*;
 
 #[event(fetch)]
 async fn main(req: Request, env: Env, _: Context) -> Result<Response> {
-    let user_id_str = setting(&env, "USER_ID").unwrap_or_default();
-
     let is_websocket = req
         .headers()
         .get("Upgrade")?
         .is_some_and(|up| up.eq_ignore_ascii_case("websocket"));
 
     if !is_websocket {
-        return serve_http(&req, &env, &user_id_str).await;
+        return serve_http(&req, &env).await;
     }
 
-    // Fail closed on a malformed USER_ID.
-    let Some(user_id) = parse_user_id(&user_id_str) else {
+    // Fail closed on a missing or malformed USER_ID.
+    let Some(user_id) = setting(&env, "USER_ID").and_then(|value| parse_user_id(&value)) else {
         console_error!("USER_ID is missing or is not a valid UUID; refusing tunnel traffic");
         return Response::error("Bad Request", 400);
     };
@@ -58,16 +56,20 @@ fn setting(env: &Env, name: &str) -> Option<String> {
 }
 
 /// Serves anything that is not a tunnel upgrade.
-async fn serve_http(req: &Request, env: &Env, user_id: &str) -> Result<Response> {
+async fn serve_http(req: &Request, env: &Env) -> Result<Response> {
     let show_uri = setting(env, "SHOW_URI").is_some_and(|value| value.eq_ignore_ascii_case("true"));
 
-    // Exact match, not a substring.
-    if show_uri && !user_id.is_empty() && req.path() == format!("/{user_id}") {
-        let host = req.url()?.host_str().unwrap_or_default().to_string();
-        // Encoded `/ws?ed=512`; `ed` is what enables early data.
-        return Response::ok(format!(
-            "vless://{user_id}@{host}:443?encryption=none&security=tls&sni={host}&fp=chrome&type=ws&host={host}&path=%2Fws%3Fed%3D512#workers-tunnel"
-        ));
+    // Exact match, not a substring. Read USER_ID only for this branch.
+    if show_uri {
+        if let Some(user_id) = setting(env, "USER_ID") {
+            if req.path() == format!("/{user_id}") {
+                let host = req.url()?.host_str().unwrap_or_default().to_string();
+                // Encoded `/ws?ed=512`; `ed` is what enables early data.
+                return Response::ok(format!(
+                    "vless://{user_id}@{host}:443?encryption=none&security=tls&sni={host}&fp=chrome&type=ws&host={host}&path=%2Fws%3Fed%3D512#workers-tunnel"
+                ));
+            }
+        }
     }
 
     let Some(site) = setting(env, "FALLBACK_SITE") else {
@@ -650,7 +652,6 @@ mod websocket {
         time::Duration,
     };
 
-    use bytes::{BufMut, BytesMut};
     use pin_project::pin_project;
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
     use worker::{Delay, EventStream, WebSocket, WebsocketEvent};
@@ -666,7 +667,10 @@ mod websocket {
         stream: EventStream<'a>,
         #[pin]
         write_delay: Option<Delay>,
-        read_buffer: BytesMut,
+        /// A partially-read WebSocket message. Keeping the message `Vec`
+        /// avoids copying it into an intermediate `BytesMut` first.
+        pending: Option<Vec<u8>>,
+        pending_pos: usize,
         closed: bool,
     }
 
@@ -676,16 +680,14 @@ mod websocket {
             stream: EventStream<'a>,
             early_data: Option<Vec<u8>>,
         ) -> Self {
-            let mut read_buffer = BytesMut::new();
-            if let Some(data) = early_data {
-                read_buffer.put_slice(&data)
-            }
+            let pending = early_data.filter(|data| !data.is_empty());
 
             Self {
                 ws,
                 stream,
                 write_delay: None,
-                read_buffer,
+                pending,
+                pending_pos: 0,
                 closed: false,
             }
         }
@@ -725,6 +727,25 @@ mod websocket {
         }
     }
 
+    fn drain_pending(pending: &mut Option<Vec<u8>>, pos: &mut usize, buf: &mut ReadBuf<'_>) {
+        while buf.remaining() > 0 {
+            let Some(data) = pending.take() else { break };
+            let len = data.len();
+            if *pos >= len {
+                *pos = 0;
+                continue;
+            }
+            let n = (len - *pos).min(buf.remaining());
+            buf.put_slice(&data[*pos..*pos + n]);
+            *pos += n;
+            if *pos < len {
+                *pending = Some(data);
+                break;
+            }
+            *pos = 0;
+        }
+    }
+
     impl AsyncRead for WebSocketStream<'_> {
         fn poll_read(
             self: Pin<&mut Self>,
@@ -732,18 +753,31 @@ mod websocket {
             buf: &mut ReadBuf<'_>,
         ) -> Poll<Result<()>> {
             let mut this = self.project();
+            let start_filled = buf.filled().len();
 
+            // Drain a message left partially read by the previous poll first.
+            drain_pending(this.pending, this.pending_pos, buf);
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
             if *this.closed {
                 return Poll::Ready(Ok(()));
             }
 
-            // A `Ready` filling nothing is EOF; `bytes()` is `None` on text.
-            while this.read_buffer.is_empty() {
+            // No buffered data: get at least one message, then keep draining
+            // ready messages until the caller's buffer is full or the stream
+            // would block. Copying the message `Vec` straight into `ReadBuf`
+            // removes the old `Vec -> BytesMut -> ReadBuf` double copy.
+            loop {
                 match this.stream.as_mut().poll_next(cx) {
-                    Poll::Pending => return Poll::Pending,
                     Poll::Ready(Some(Ok(WebsocketEvent::Message(msg)))) => {
-                        if let Some(data) = msg.bytes() {
-                            this.read_buffer.put_slice(&data);
+                        if let Some(data) = msg.bytes().filter(|data| !data.is_empty()) {
+                            *this.pending = Some(data);
+                            *this.pending_pos = 0;
+                            drain_pending(this.pending, this.pending_pos, buf);
+                            if buf.remaining() == 0 {
+                                return Poll::Ready(Ok(()));
+                            }
                         }
                     }
                     Poll::Ready(Some(Ok(WebsocketEvent::Close(_)))) | Poll::Ready(None) => {
@@ -752,36 +786,22 @@ mod websocket {
                     }
                     Poll::Ready(Some(Err(e))) => {
                         *this.closed = true;
+                        // If this poll produced data, let the caller consume it
+                        // before surfacing the error on the next poll.
+                        if buf.filled().len() > start_filled {
+                            return Poll::Ready(Ok(()));
+                        }
                         return Poll::Ready(Err(Error::other(e.to_string())));
                     }
+                    Poll::Pending => {
+                        return if buf.filled().len() > start_filled {
+                            Poll::Ready(Ok(()))
+                        } else {
+                            Poll::Pending
+                        };
+                    }
                 }
             }
-
-            // Coalesce what is already queued, stopping at anything terminal.
-            while this.read_buffer.len() < buf.remaining() {
-                match this.stream.as_mut().poll_next(cx) {
-                    Poll::Ready(Some(Ok(WebsocketEvent::Message(msg)))) => {
-                        if let Some(data) = msg.bytes() {
-                            this.read_buffer.put_slice(&data);
-                        }
-                    }
-                    Poll::Ready(Some(Ok(WebsocketEvent::Close(_)))) | Poll::Ready(None) => {
-                        *this.closed = true;
-                        break;
-                    }
-                    Poll::Ready(Some(Err(_))) => {
-                        // Deliberately unlike the loop above: bytes are already
-                        // buffered, so deliver them and end the stream next call.
-                        *this.closed = true;
-                        break;
-                    }
-                    Poll::Pending => break,
-                }
-            }
-
-            let amt = std::cmp::min(this.read_buffer.len(), buf.remaining());
-            buf.put_slice(&this.read_buffer.split_to(amt));
-            Poll::Ready(Ok(()))
         }
     }
 
@@ -828,6 +848,48 @@ mod websocket {
             }
 
             Poll::Ready(Ok(()))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::drain_pending;
+        use tokio::io::ReadBuf;
+
+        #[test]
+        fn drains_partial_message_across_polls() {
+            let mut pending = Some(b"hello".to_vec());
+            let mut pos = 0;
+
+            let mut out = [0u8; 3];
+            let mut buf = ReadBuf::new(&mut out);
+            drain_pending(&mut pending, &mut pos, &mut buf);
+            assert_eq!(buf.filled(), &b"hel"[..]);
+            assert_eq!(pos, 3);
+            assert_eq!(pending.as_deref(), Some(&b"hello"[..]));
+
+            let mut out = [0u8; 8];
+            let mut buf = ReadBuf::new(&mut out);
+            drain_pending(&mut pending, &mut pos, &mut buf);
+            assert_eq!(buf.filled(), &b"lo"[..]);
+            assert!(pending.is_none());
+            assert_eq!(pos, 0);
+        }
+
+        #[test]
+        fn drains_multiple_messages_into_one_read() {
+            let mut pending = None;
+            let mut out = [0u8; 6];
+            let mut buf = ReadBuf::new(&mut out);
+
+            for data in [b"abc".to_vec(), b"def".to_vec()] {
+                let mut pos = 0;
+                pending = Some(data);
+                drain_pending(&mut pending, &mut pos, &mut buf);
+            }
+
+            assert_eq!(buf.filled(), &b"abcdef"[..]);
+            assert!(pending.is_none());
         }
     }
 }
